@@ -3,6 +3,7 @@ from sqlalchemy import Column, String, DateTime, Integer, Text, text
 from sqlalchemy.dialects.postgresql import UUID
 from app.db import Base
 
+
 class Event(Base):
     __tablename__ = "events"
 
@@ -17,7 +18,7 @@ class Event(Base):
     per_user_cap = Column(Integer, nullable=False, default=1)
     status = Column(String, nullable=False, default='DRAFT')
     created_at = Column(DateTime, nullable=False, server_default=text('now()'))
-    image = Column(Text)
+    image_path = Column(Text)
     url = Column(Text)
     description = Column(Text)
     btn_name = Column(Text)
