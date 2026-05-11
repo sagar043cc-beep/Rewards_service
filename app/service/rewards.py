@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 
 from app.models.rewards import Reward
-from app.schemas.rewards import RewardCreate, RewardUpdate, RewardPayload
+from app.schemas.rewards import RewardCreate, RewardUpdate
 
 logger = logging.getLogger(__name__)
 
@@ -30,10 +30,12 @@ class ValidationError(RewardServiceError):
 
 def _safe_expunge(db: Session, obj: Reward) -> Reward:
     """
-    Eagerly load all mapped columns before expunging so the returned
-    object is safe to use after the session is closed or committed.
+    Expunge the given ORM object from the session so it can be used
+    after the session is closed or committed.
+    
+    For objects returned via RETURNING from INSERT/UPDATE/DELETE,
+    all column values are already populated, so no refresh is needed.
     """
-    db.refresh(obj)
     db.expunge(obj)
     return obj
 
@@ -97,9 +99,37 @@ def get_reward(db: Session, reward_id: UUID) -> Optional[Reward]:
 
 # ─── Create ─────────────────────────────────────────────────────────────────────
 
-def create_reward(db: Session, payload: RewardCreate) -> Reward:
+def create_reward(db: Session, reward_in: RewardCreate) -> Reward:
     """Insert a new reward row."""
-    db_reward = Reward(**payload.model_dump())
+    # Convert flat input schema to ORM-compatible dict with JSON payload
+    data = reward_in.model_dump()
+    reward_type = data.get('type')
+
+    # Build payload dict from type-specific fields and remove them from data
+    if reward_type == 'WALLET':
+        payload = {
+            'amount': data.pop('amount'),
+            'currency': data.pop('currency'),
+        }
+    elif reward_type == 'PACKAGE':
+        payload = {
+            'package_id': str(data.pop('package_id')),
+            'quantity': data.pop('quantity'),
+        }
+    elif reward_type == 'BADGE':
+        payload = {
+            'badge_slug': data.pop('badge_slug'),
+        }
+    elif reward_type == 'XP':
+        payload = {
+            'points': data.pop('points'),
+        }
+    else:
+        raise ValidationError(f'Unsupported reward type: {reward_type}')
+
+    data['payload'] = payload
+
+    db_reward = Reward(**data)
     db.add(db_reward)
 
     try:

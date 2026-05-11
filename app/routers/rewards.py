@@ -1,9 +1,8 @@
-import json
 import logging
 from typing import Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Form, HTTPException, status
+from fastapi import APIRouter, Depends, Body, HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.db import get_db
@@ -109,37 +108,17 @@ def read_reward(reward_id: UUID, db: Session = Depends(get_db)):
 
 @router.post("/", status_code=status.HTTP_201_CREATED)
 def create_new_reward(
-    name: str = Form(...),
-    type: str = Form(...),
-    payload: str = Form(...),  # JSON string
-    tenant_id: Optional[UUID] = Form(None),
-    is_active: bool = Form(True),
+    reward_in: RewardCreate = Body(...),
     db: Session = Depends(get_db),
 ):
     """
     Create a new reward.
-    Payload must be a JSON string matching the structure for the given type.
+    Send JSON body with fields appropriate to the reward type.
     """
     try:
-        # Parse JSON payload manually (Form gives string)
-        payload_dict = json.loads(payload)
-
-        reward_in = RewardCreate(
-            tenant_id=tenant_id,
-            name=name,
-            type=type,
-            is_active=is_active,
-            payload=payload_dict,
-        )
         db_reward = create_reward(db, reward_in)
-    except json.JSONDecodeError:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="payload must be valid JSON",
-        )
     except ValidationError as exc:
         _raise_validation(exc)
-
     return success_response(
         message="Reward created successfully",
         data=_reward_to_dict(db_reward),
@@ -151,41 +130,14 @@ def create_new_reward(
 @router.put("/{reward_id}", status_code=status.HTTP_200_OK)
 def update_existing_reward(
     reward_id: UUID,
-    name: Optional[str] = Form(None),
-    type: Optional[str] = Form(None),
-    payload: Optional[str] = Form(None),
-    tenant_id: Optional[UUID] = Form(None),
-    is_active: Optional[bool] = Form(None),
+    reward_in: RewardUpdate = Body(...),
     db: Session = Depends(get_db),
 ):
     """
     Partial update of a reward — only supplied fields are updated.
-    If payload is provided, it must be valid JSON and match the type.
+    Send JSON body with the fields to update.
     """
-    update_data = {}
-    if name is not None:
-        update_data["name"] = name
-    if type is not None:
-        update_data["type"] = type
-    if tenant_id is not None:
-        update_data["tenant_id"] = tenant_id
-    if is_active is not None:
-        update_data["is_active"] = is_active
-
-    # Handle payload separately
-    payload_dict = None
-    if payload is not None:
-        try:
-            payload_dict = json.loads(payload)
-            update_data["payload"] = payload_dict
-        except json.JSONDecodeError:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="payload must be valid JSON",
-            )
-
     try:
-        reward_in = RewardUpdate(**update_data)
         db_reward = update_reward(db, reward_id, reward_in)
     except NotFoundError:
         _raise_not_found(reward_id)

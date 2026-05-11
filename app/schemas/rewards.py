@@ -1,9 +1,10 @@
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from typing import Optional, Literal, Union
-from uuid import UUID
 from typing_extensions import Annotated
+from uuid import UUID
+from datetime import datetime
 
-# ─── Payload Schemas ────────────────────────────────────────────────────────────
+# ─── Payload validation models (used in RewardUpdate) ───────────────────────────
 
 class WalletPayload(BaseModel):
     amount: int = Field(..., gt=0)
@@ -19,73 +20,44 @@ class BadgePayload(BaseModel):
 class XpPayload(BaseModel):
     points: int = Field(..., gt=0)
 
-# Union of all valid payload types — discriminated by Reward.type
-RewardPayload = Annotated[
-    Union[WalletPayload, PackagePayload, BadgePayload, XpPayload],
-    Field(discriminator='type')
-]
+# ─── Create Schemas (flat structure per type) ───────────────────────────────────
 
-# ─── Base Schema ───────────────────────────────────────────────────────────────
-
-class RewardBase(BaseModel):
+class RewardInputBase(BaseModel):
+    """Common fields for all reward creation requests."""
     tenant_id: Optional[UUID] = None
     name: str = Field(..., min_length=1, max_length=128, strip_whitespace=True)
-    type: Literal['WALLET', 'PACKAGE', 'BADGE', 'XP']
     is_active: bool = True
-    payload: dict  # Raw dict; validated via root_validator using type
 
     @field_validator('name')
     @classmethod
     def validate_name_uppercase(cls, v: str) -> str:
-        """Names are stored uppercase for consistency."""
         return v.upper().strip()
 
-    @field_validator('type')
-    @classmethod
-    def validate_type_uppercase(cls, v: str) -> str:
-        """Type must be uppercase."""
-        return v.upper()
+class WalletCreate(RewardInputBase):
+    type: Literal['WALLET'] = 'WALLET'
+    amount: int = Field(..., gt=0)
+    currency: str = Field(..., min_length=3, max_length=3, strip_whitespace=True)
 
-    @field_validator('payload', mode='before')
-    @classmethod
-    def validate_payload_structure(cls, v: dict, info) -> dict:
-        """
-        Validate payload structure based on the reward type.
-        Uses Pydantic models per-type for strict validation.
-        """
-        if v is None:
-            return v
+class PackageCreate(RewardInputBase):
+    type: Literal['PACKAGE'] = 'PACKAGE'
+    package_id: UUID
+    quantity: int = Field(..., gt=0)
 
-        reward_type = info.data.get('type')
-        if not reward_type:
-            raise ValueError('type must be set before payload validation')
+class BadgeCreate(RewardInputBase):
+    type: Literal['BADGE'] = 'BADGE'
+    badge_slug: str = Field(..., min_length=1, max_length=128)
 
-        # Map type to payload model
-        payload_models = {
-            'WALLET': WalletPayload,
-            'PACKAGE': PackagePayload,
-            'BADGE': BadgePayload,
-            'XP': XpPayload,
-        }
+class XpCreate(RewardInputBase):
+    type: Literal['XP'] = 'XP'
+    points: int = Field(..., gt=0)
 
-        model = payload_models.get(reward_type)
-        if not model:
-            raise ValueError(f'Unsupported reward type: {reward_type}')
+# Union type for create endpoint (discriminated by 'type')
+RewardCreate = Annotated[
+    Union[WalletCreate, PackageCreate, BadgeCreate, XpCreate],
+    Field(discriminator='type')
+]
 
-        # Validate and return normalized dict
-        try:
-            validated = model(**v)
-            return validated.model_dump()
-        except Exception as exc:
-            raise ValueError(f'Invalid payload for type {reward_type}: {str(exc)}') from exc
-
-
-# ─── Create / Update ────────────────────────────────────────────────────────────
-
-class RewardCreate(RewardBase):
-    """All fields required except tenant_id (defaults from auth/session)."""
-    pass
-
+# ─── Update Schema ───────────────────────────────────────────────────────────────
 
 class RewardUpdate(BaseModel):
     """Partial update — only supplied fields are modified."""
@@ -114,37 +86,33 @@ class RewardUpdate(BaseModel):
         """If payload provided, validate against current or new type."""
         if v is None:
             return v
-
         reward_type = info.data.get('type')
         if not reward_type:
-            # Type not being updated; we need the existing type from DB
-            # This validator runs before DB fetch, so skip deep validation here
-            # The service layer will re-validate with actual type
             return v
-
-        # Same validation logic as RewardBase
         payload_models = {
             'WALLET': WalletPayload,
             'PACKAGE': PackagePayload,
             'BADGE': BadgePayload,
             'XP': XpPayload,
         }
-
         model = payload_models.get(reward_type)
         if not model:
             raise ValueError(f'Unsupported reward type: {reward_type}')
-
         try:
             validated = model(**v)
-            return validated.model_dump()
+            return validated.model_dump(mode='json')
         except Exception as exc:
             raise ValueError(f'Invalid payload for type {reward_type}: {str(exc)}') from exc
 
+# ─── Output Schema ───────────────────────────────────────────────────────────────
 
-# ─── Output Schema ──────────────────────────────────────────────────────────────
-
-class RewardOut(RewardBase):
+class RewardOut(BaseModel):
     id: UUID
-    created_at: UUID  # datetime, will be serialized as ISO string
+    tenant_id: Optional[UUID] = None
+    name: str
+    type: str
+    payload: dict
+    is_active: bool
+    created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
