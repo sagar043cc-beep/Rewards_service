@@ -30,12 +30,12 @@ class ValidationError(BadgeServiceError):
 
 def _safe_expunge(db: Session, obj: Badge) -> Badge:
     """
-    Eagerly load all mapped columns before expunging so the returned
-    object is safe to use after the session is closed or committed.
-    Avoids DetachedInstanceError on later attribute access.
+    Expunge the given ORM object from the session so it can be used
+    after the session is closed or committed.
+    
+    For objects returned via RETURNING from INSERT/UPDATE/DELETE,
+    all column values are already populated, so no refresh is needed.
     """
-    # Access every column attribute to populate the instance __dict__
-    db.refresh(obj)
     db.expunge(obj)
     return obj
 
