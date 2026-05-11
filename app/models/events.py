@@ -11,9 +11,9 @@ class Event(Base):
     tenant_id = Column(UUID(as_uuid=True), nullable=False)
     code = Column(String, nullable=False)
     name = Column(String, nullable=False, index=True)
-    trigger_type = Column(String, nullable=False)
-    starts_at = Column(DateTime, nullable=False)
-    ends_at = Column(DateTime, nullable=False)
+    type = Column(String, nullable=False)  # 'static' | 'action'
+    starts_at = Column(DateTime, nullable=True)
+    ends_at = Column(DateTime, nullable=True)
     max_participants = Column(Integer)
     per_user_cap = Column(Integer, nullable=False, default=1)
     status = Column(String, nullable=False, default='DRAFT')
@@ -22,4 +22,5 @@ class Event(Base):
     url = Column(Text)
     description = Column(Text)
     btn_name = Column(Text)
+    sort_order = Column(Integer, nullable=True)  # optional display ordering
   

@@ -1,4 +1,5 @@
 import logging
+import uuid
 from uuid import UUID
 from typing import Tuple, List, Optional
 from datetime import datetime
@@ -43,21 +44,28 @@ def _safe_expunge(db: Session, obj: Event) -> Event:
 
 def _event_to_dict(e: Event) -> dict:
     """Convert Event ORM object to API response dict."""
+    image_url = None
+    if e.image_path:
+        if e.image_path.startswith(("http://", "https://")):
+            image_url = e.image_path
+        else:
+            image_url = f"/static/{e.image_path}"
     return {
         "id": str(e.id),
         "tenant_id": str(e.tenant_id),
         "code": e.code,
         "name": e.name,
-        "trigger_type": e.trigger_type,
+        "type": e.type,
         "starts_at": e.starts_at.isoformat() if e.starts_at else None,
         "ends_at": e.ends_at.isoformat() if e.ends_at else None,
         "max_participants": e.max_participants,
         "per_user_cap": e.per_user_cap,
         "status": e.status,
-        "image_url": e.image_path,
+        "image_url": image_url,
         "url": e.url,
         "description": e.description,
         "btn_name": e.btn_name,
+        "sort_order": e.sort_order,
         "created_at": e.created_at.isoformat() if e.created_at else None,
     }
 
@@ -84,9 +92,13 @@ def get_events(
     if tenant_id is not None:
         stmt = stmt.where(Event.tenant_id == tenant_id)
     if status is not None:
-        stmt = stmt.where(Event.status == status.upper())
+        stmt = stmt.where(Event.status == status)
 
-    stmt = stmt.order_by(Event.created_at.desc()).offset(offset).limit(page_size)
+    # Order by sort_order (ascending, NULLS LAST), then created_at DESC
+    stmt = stmt.order_by(
+        Event.sort_order.asc().nullslast(),
+        Event.created_at.desc()
+    ).offset(offset).limit(page_size)
 
     rows = db.execute(stmt).all()
 
@@ -107,7 +119,13 @@ def get_event(db: Session, event_id: UUID) -> Optional[Event]:
 
 def create_event(db: Session, payload: EventCreate) -> Event:
     """Insert a new event row."""
-    db_event = Event(**payload.model_dump())
+    data = payload.model_dump()
+
+    # Generate code if not provided
+    if not data.get('code'):
+        data['code'] = str(uuid.uuid4().hex[:8])
+
+    db_event = Event(**data)
     db.add(db_event)
 
     try:

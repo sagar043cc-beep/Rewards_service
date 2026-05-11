@@ -5,6 +5,7 @@ from typing import Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Form, HTTPException, status, UploadFile, File
+from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy.orm import Session
 
 from app.db import get_db
@@ -48,7 +49,7 @@ def _event_to_dict(e: Event) -> dict:
         "tenant_id": str(e.tenant_id),
         "code": e.code,
         "name": e.name,
-        "trigger_type": e.trigger_type,
+        "type": e.type,
         "starts_at": e.starts_at.isoformat() if e.starts_at else None,
         "ends_at": e.ends_at.isoformat() if e.ends_at else None,
         "max_participants": e.max_participants,
@@ -58,6 +59,7 @@ def _event_to_dict(e: Event) -> dict:
         "url": e.url,
         "description": e.description,
         "btn_name": e.btn_name,
+        "sort_order": e.sort_order,
         "created_at": e.created_at.isoformat() if e.created_at else None,
     }
 
@@ -180,50 +182,63 @@ def read_event(event_id: UUID, db: Session = Depends(get_db)):
 @router.post("/", status_code=status.HTTP_201_CREATED)
 async def create_new_event(
     tenant_id: UUID = Form(...),
-    code: str = Form(...),
     name: str = Form(...),
-    trigger_type: str = Form(...),
-    starts_at: str = Form(...),  # ISO format string, will be parsed by Pydantic
-    ends_at: str = Form(...),
-    image: Optional[UploadFile] = File(None),
-    max_participants: Optional[int] = Form(None),
-    per_user_cap: int = Form(1),
-    status: Optional[str] = Form(None),
-    url: Optional[str] = Form(None),
     description: Optional[str] = Form(None),
-    btn_name: Optional[str] = Form(None),
+    starts_at: Optional[str] = Form(None),
+    ends_at: Optional[str] = Form(None),
+    image: Optional[UploadFile] = File(None),
+    max_participants: int = Form(...),
+    status: str = Form(...),
+    type: str = Form(...),
+    sort_order: Optional[int] = Form(None),
     db: Session = Depends(get_db),
 ):
     """Create a new event with optional image."""
+    saved_image_path = None
     try:
-        # Parse datetime strings (Pydantic would do this but we're using Form)
+        # Parse optional datetime strings
         from datetime import datetime
+        starts_at_dt = None
+        if starts_at:
+            try:
+                starts_at_dt = datetime.fromisoformat(starts_at.replace('Z', '+00:00'))
+            except ValueError as e:
+                raise ValidationError(f"Invalid starts_at datetime format: {e}")
+        ends_at_dt = None
+        if ends_at:
+            try:
+                ends_at_dt = datetime.fromisoformat(ends_at.replace('Z', '+00:00'))
+            except ValueError as e:
+                raise ValidationError(f"Invalid ends_at datetime format: {e}")
+
+        # Build event data without image and validate
+        event_data = {
+            "tenant_id": tenant_id,
+            "name": name,
+            "description": description,
+            "starts_at": starts_at_dt,
+            "ends_at": ends_at_dt,
+            "max_participants": max_participants,
+            "status": status,
+            "type": type,
+            "image_path": None,
+            "sort_order": sort_order,
+        }
         try:
-            starts_at_dt = datetime.fromisoformat(starts_at.replace('Z', '+00:00'))
-            ends_at_dt = datetime.fromisoformat(ends_at.replace('Z', '+00:00'))
-        except ValueError as e:
-            raise ValidationError(f"Invalid datetime format: {e}")
+            event_in = EventCreate(**event_data)  # may raise PydanticValidationError
+        except PydanticValidationError as e:
+            raise ValidationError(str(e))
 
-        image_path = None
+        # Save image only after other fields validated
         if image is not None:
-            image_path = _save_image_file(image)
+            saved_image_path = _save_image_file(image)
+            event_in.image_path = saved_image_path
 
-        event_in = EventCreate(
-            tenant_id=tenant_id,
-            code=code,
-            name=name,
-            trigger_type=trigger_type,
-            starts_at=starts_at_dt,
-            ends_at=ends_at_dt,
-            max_participants=max_participants,
-            per_user_cap=per_user_cap,
-            image_path=image_path,
-            url=url,
-            description=description,
-            btn_name=btn_name,
-        )
         db_event = create_event(db, event_in)
-    except ValidationError as exc:
+    except (ValidationError, PydanticValidationError) as exc:
+        # Clean up image if it was saved but event creation failed
+        if saved_image_path:
+            _delete_image_file(saved_image_path)
         _raise_validation(exc)
 
     return success_response(
@@ -238,7 +253,7 @@ async def create_new_event(
 async def update_existing_event(
     event_id: UUID,
     name: Optional[str] = Form(None),
-    trigger_type: Optional[str] = Form(None),
+    type: Optional[str] = Form(None),
     starts_at: Optional[str] = Form(None),
     ends_at: Optional[str] = Form(None),
     max_participants: Optional[int] = Form(None),
@@ -248,6 +263,7 @@ async def update_existing_event(
     url: Optional[str] = Form(None),
     description: Optional[str] = Form(None),
     btn_name: Optional[str] = Form(None),
+    sort_order: Optional[int] = Form(None),
     db: Session = Depends(get_db),
 ):
     """Partial update of an event (only supplied fields are changed)."""
@@ -257,11 +273,15 @@ async def update_existing_event(
         if old_event is None:
             _raise_not_found(event_id)
 
+        # Initialize image path tracker for cleanup on failure
+        new_image_path = None
+
+        # Collect non-image updates
         update_data = {}
         if name is not None:
             update_data["name"] = name
-        if trigger_type is not None:
-            update_data["trigger_type"] = trigger_type
+        if type is not None:
+            update_data["type"] = type
         if max_participants is not None:
             update_data["max_participants"] = max_participants
         if per_user_cap is not None:
@@ -274,11 +294,8 @@ async def update_existing_event(
             update_data["description"] = description
         if btn_name is not None:
             update_data["btn_name"] = btn_name
-
-        new_image_path = None
-        if image is not None:
-            new_image_path = _save_image_file(image)
-            update_data["image_path"] = new_image_path
+        if sort_order is not None:
+            update_data["sort_order"] = sort_order
 
         # Handle datetime fields
         from datetime import datetime
@@ -293,6 +310,18 @@ async def update_existing_event(
             except ValueError as e:
                 raise ValidationError(f"Invalid ends_at datetime format: {e}")
 
+        # Validate non-image fields before potentially saving image
+        if update_data:
+            try:
+                EventUpdate(**update_data)  # may raise PydanticValidationError
+            except PydanticValidationError as e:
+                raise ValidationError(str(e))
+
+        # Handle image upload (after validating other fields)
+        if image is not None:
+            new_image_path = _save_image_file(image)
+            update_data["image_path"] = new_image_path
+
         if not update_data:
             # Nothing to change — return existing
             return success_response(
@@ -300,16 +329,28 @@ async def update_existing_event(
                 data=_event_to_dict(old_event),
             )
 
-        event_in = EventUpdate(**update_data)
-        db_event = update_event(db, event_id, event_in)
+        try:
+            event_in = EventUpdate(**update_data)
+            db_event = update_event(db, event_id, event_in)
+        except Exception:
+            # Clean up newly saved image on any failure
+            if new_image_path:
+                _delete_image_file(new_image_path)
+            raise
 
-        # Delete old image if it was replaced
+        # Delete old image if it was replaced (only on success)
         if new_image_path and old_event.image_path and old_event.image_path != new_image_path:
             _delete_image_file(old_event.image_path)
 
     except NotFoundError:
+        # Ensure cleanup if image was saved before NotFound occurred
+        if new_image_path:
+            _delete_image_file(new_image_path)
         _raise_not_found(event_id)
-    except ValidationError as exc:
+    except (ValidationError, PydanticValidationError) as exc:
+        # Ensure cleanup if image was saved before validation error
+        if new_image_path:
+            _delete_image_file(new_image_path)
         _raise_validation(exc)
 
     return success_response(
