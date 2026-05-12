@@ -44,6 +44,7 @@ def _safe_expunge(db: Session, obj: Badge) -> Badge:
 
 def get_badges(
     db: Session,
+    tenant_id: UUID,
     page: int = 1,
     page_size: int = 10,
 ) -> Tuple[List[Badge], int]:
@@ -56,6 +57,7 @@ def get_badges(
 
     stmt = (
         select(Badge, count_col)
+        .where(Badge.tenant_id == tenant_id)
         .order_by(Badge.name)
         .offset(offset)
         .limit(page_size)

@@ -3,3 +3,6 @@ uvicorn
 sqlalchemy
 alembic
 psycopg2-binary
+google-cloud-storage
+pyjwt
+python-dotenv

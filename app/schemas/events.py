@@ -19,7 +19,7 @@ class EventBase(BaseModel):
     per_user_cap: int = 1
     status: EventStatus
     image_path: Optional[str] = Field(None, max_length=2048)
-    url: Optional[str] = Field(None, max_length=2048)
+    location: Optional[str] = Field(None, max_length=2048)
     description: Optional[str] = Field(None, max_length=5000)
     btn_name: Optional[str] = Field(None, max_length=128)
     sort_order: Optional[int] = None
@@ -43,6 +43,7 @@ class EventCreate(BaseModel):
     status: EventStatus
     type: EventType
     image_path: Optional[str] = Field(None, max_length=2048)
+    location: Optional[str] = Field(None, max_length=2048)
     sort_order: Optional[int] = Field(None, ge=0)
 
     @root_validator(skip_on_failure=True)
@@ -64,7 +65,7 @@ class EventUpdate(BaseModel):
     status: Optional[EventStatus] = None
     type: Optional[EventType] = None
     image_path: Optional[str] = Field(None, max_length=2048)
-    url: Optional[str] = Field(None, max_length=2048)
+    location: Optional[str] = Field(None, max_length=2048)
     btn_name: Optional[str] = Field(None, max_length=128)
     sort_order: Optional[int] = Field(None, ge=0)
 

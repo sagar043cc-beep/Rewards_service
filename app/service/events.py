@@ -2,7 +2,6 @@ import logging
 import uuid
 from uuid import UUID
 from typing import Tuple, List, Optional
-from datetime import datetime
 
 from sqlalchemy import select, func, update as sa_update, delete as sa_delete
 from sqlalchemy.orm import Session
@@ -42,40 +41,13 @@ def _safe_expunge(db: Session, obj: Event) -> Event:
     return obj
 
 
-def _event_to_dict(e: Event) -> dict:
-    """Convert Event ORM object to API response dict."""
-    image_url = None
-    if e.image_path:
-        if e.image_path.startswith(("http://", "https://")):
-            image_url = e.image_path
-        else:
-            image_url = f"/static/{e.image_path}"
-    return {
-        "id": str(e.id),
-        "tenant_id": str(e.tenant_id),
-        "code": e.code,
-        "name": e.name,
-        "type": e.type,
-        "starts_at": e.starts_at.isoformat() if e.starts_at else None,
-        "ends_at": e.ends_at.isoformat() if e.ends_at else None,
-        "max_participants": e.max_participants,
-        "per_user_cap": e.per_user_cap,
-        "status": e.status,
-        "image_url": image_url,
-        "url": e.url,
-        "description": e.description,
-        "btn_name": e.btn_name,
-        "sort_order": e.sort_order,
-        "created_at": e.created_at.isoformat() if e.created_at else None,
-    }
-
-
 # ─── Queries ────────────────────────────────────────────────────────────────────
 
 def get_events(
     db: Session,
     tenant_id: Optional[UUID] = None,
     status: Optional[str] = None,
+    location: Optional[str] = None,
     page: int = 1,
     page_size: int = 10,
 ) -> Tuple[List[Event], int]:
@@ -93,6 +65,8 @@ def get_events(
         stmt = stmt.where(Event.tenant_id == tenant_id)
     if status is not None:
         stmt = stmt.where(Event.status == status)
+    if location is not None:
+        stmt = stmt.where(Event.location.ilike(f"%{location}%"))
 
     # Order by sort_order (ascending, NULLS LAST), then created_at DESC
     stmt = stmt.order_by(

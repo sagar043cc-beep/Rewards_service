@@ -9,8 +9,8 @@ from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy.orm import Session
 
 from app.db import get_db
-from app.models.events import Event
-from app.schemas.events import EventCreate, EventUpdate, EventOut
+from app.models.events import event_to_dict
+from app.schemas.events import EventCreate, EventUpdate
 from app.service.events import (
     get_events,
     get_event,
@@ -20,6 +20,7 @@ from app.service.events import (
     NotFoundError,
     ValidationError,
 )
+from app.auth import get_current_tenant_id
 from app.utils.response import success_response, paginated_response
 
 router = APIRouter(prefix="/events", tags=["Events"])
@@ -34,35 +35,6 @@ ALLOWED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
-
-def _event_to_dict(e: Event) -> dict:
-    """Convert Event ORM object to API response dict."""
-    image_url = None
-    if e.image_path:
-        # If already a full URL, use as-is; otherwise prefix static path
-        if e.image_path.startswith(("http://", "https://")):
-            image_url = e.image_path
-        else:
-            image_url = f"/static/{e.image_path}"
-    return {
-        "id": str(e.id),
-        "tenant_id": str(e.tenant_id),
-        "code": e.code,
-        "name": e.name,
-        "type": e.type,
-        "starts_at": e.starts_at.isoformat() if e.starts_at else None,
-        "ends_at": e.ends_at.isoformat() if e.ends_at else None,
-        "max_participants": e.max_participants,
-        "per_user_cap": e.per_user_cap,
-        "status": e.status,
-        "image_url": image_url,
-        "url": e.url,
-        "description": e.description,
-        "btn_name": e.btn_name,
-        "sort_order": e.sort_order,
-        "created_at": e.created_at.isoformat() if e.created_at else None,
-    }
-
 
 def _raise_not_found(event_id: UUID) -> None:
     raise HTTPException(
@@ -131,16 +103,18 @@ def _delete_image_file(image_path: Optional[str]) -> None:
 
 @router.get("/", status_code=status.HTTP_200_OK)
 def list_events(
-    tenant_id: Optional[UUID] = None,
+    tenant_id: UUID = Depends(get_current_tenant_id),
     status: Optional[str] = None,
+    location: Optional[str] = None,
     page: int = 1,
     page_size: int = 10,
     db: Session = Depends(get_db),
 ):
     """
-    List events with optional filters:
-    - tenant_id: filter by tenant
+    List events for the authenticated tenant.
+    Optional filters:
     - status: filter by event status (DRAFT, ACTIVE, PAUSED, ENDED)
+    - location: filter by location (partial match, case-insensitive)
     Pagination via offset.
     """
     page = max(page, 1)
@@ -150,12 +124,13 @@ def list_events(
         db,
         tenant_id=tenant_id,
         status=status,
+        location=location,
         page=page,
         page_size=page_size,
     )
     return paginated_response(
         message="Events fetched successfully",
-        data=[_event_to_dict(e) for e in items],
+        data=[event_to_dict(e) for e in items],
         total=total,
         page=page,
         page_size=page_size,
@@ -165,15 +140,19 @@ def list_events(
 # ─── Get single ───────────────────────────────────────────────────────────────
 
 @router.get("/{event_id}", status_code=status.HTTP_200_OK)
-def read_event(event_id: UUID, db: Session = Depends(get_db)):
-    """Fetch a single event by ID."""
+def read_event(
+    event_id: UUID,
+    db: Session = Depends(get_db),
+    tenant_id: UUID = Depends(get_current_tenant_id),
+):
+    """Fetch a single event by ID (tenant-scoped)."""
     db_event = get_event(db, event_id)
-    if not db_event:
+    if not db_event or db_event.tenant_id != tenant_id:
         _raise_not_found(event_id)
 
     return success_response(
         message="Event fetched successfully",
-        data=_event_to_dict(db_event),
+        data=event_to_dict(db_event),
     )
 
 
@@ -181,20 +160,20 @@ def read_event(event_id: UUID, db: Session = Depends(get_db)):
 
 @router.post("/", status_code=status.HTTP_201_CREATED)
 async def create_new_event(
-    tenant_id: UUID = Form(...),
+    tenant_id: UUID = Depends(get_current_tenant_id),
     name: str = Form(...),
     description: Optional[str] = Form(None),
     starts_at: Optional[str] = Form(None),
     ends_at: Optional[str] = Form(None),
-    image: Optional[UploadFile] = File(None),
+    image_path: Optional[str] = Form(None),
+    location: Optional[str] = Form(None),
     max_participants: int = Form(...),
     status: str = Form(...),
     type: str = Form(...),
     sort_order: Optional[int] = Form(None),
     db: Session = Depends(get_db),
 ):
-    """Create a new event with optional image."""
-    saved_image_path = None
+    """Create a new event for the authenticated tenant."""
     try:
         # Parse optional datetime strings
         from datetime import datetime
@@ -221,7 +200,8 @@ async def create_new_event(
             "max_participants": max_participants,
             "status": status,
             "type": type,
-            "image_path": None,
+            "image_path": image_path,
+            "location": location,
             "sort_order": sort_order,
         }
         try:
@@ -229,21 +209,13 @@ async def create_new_event(
         except PydanticValidationError as e:
             raise ValidationError(str(e))
 
-        # Save image only after other fields validated
-        if image is not None:
-            saved_image_path = _save_image_file(image)
-            event_in.image_path = saved_image_path
-
         db_event = create_event(db, event_in)
     except (ValidationError, PydanticValidationError) as exc:
-        # Clean up image if it was saved but event creation failed
-        if saved_image_path:
-            _delete_image_file(saved_image_path)
         _raise_validation(exc)
 
     return success_response(
         message="Event created successfully",
-        data=_event_to_dict(db_event),
+        data=event_to_dict(db_event),
     )
 
 
@@ -252,6 +224,7 @@ async def create_new_event(
 @router.put("/{event_id}", status_code=status.HTTP_200_OK)
 async def update_existing_event(
     event_id: UUID,
+    tenant_id: UUID = Depends(get_current_tenant_id),
     name: Optional[str] = Form(None),
     type: Optional[str] = Form(None),
     starts_at: Optional[str] = Form(None),
@@ -260,7 +233,7 @@ async def update_existing_event(
     per_user_cap: Optional[int] = Form(None),
     status: Optional[str] = Form(None),
     image: Optional[UploadFile] = File(None),
-    url: Optional[str] = Form(None),
+    location: Optional[str] = Form(None),
     description: Optional[str] = Form(None),
     btn_name: Optional[str] = Form(None),
     sort_order: Optional[int] = Form(None),
@@ -268,9 +241,11 @@ async def update_existing_event(
 ):
     """Partial update of an event (only supplied fields are changed)."""
     try:
-        # Fetch existing event for potential image cleanup
+        # Fetch existing event for potential image cleanup and ownership check
         old_event = get_event(db, event_id)
         if old_event is None:
+            _raise_not_found(event_id)
+        if old_event.tenant_id != tenant_id:
             _raise_not_found(event_id)
 
         # Initialize image path tracker for cleanup on failure
@@ -288,8 +263,8 @@ async def update_existing_event(
             update_data["per_user_cap"] = per_user_cap
         if status is not None:
             update_data["status"] = status
-        if url is not None:
-            update_data["url"] = url
+        if location is not None:
+            update_data["location"] = location
         if description is not None:
             update_data["description"] = description
         if btn_name is not None:
@@ -326,7 +301,7 @@ async def update_existing_event(
             # Nothing to change — return existing
             return success_response(
                 message="Event updated successfully",
-                data=_event_to_dict(old_event),
+                data=event_to_dict(old_event),
             )
 
         try:
@@ -355,16 +330,25 @@ async def update_existing_event(
 
     return success_response(
         message="Event updated successfully",
-        data=_event_to_dict(db_event),
+        data=event_to_dict(db_event),
     )
 
 
 # ─── Delete ───────────────────────────────────────────────────────────────────
 
 @router.delete("/{event_id}", status_code=status.HTTP_200_OK)
-def delete_existing_event(event_id: UUID, db: Session = Depends(get_db)):
-    """Delete an event by ID."""
+def delete_existing_event(
+    event_id: UUID,
+    db: Session = Depends(get_db),
+    tenant_id: UUID = Depends(get_current_tenant_id),
+):
+    """Delete an event by ID (tenant-scoped)."""
     try:
+        # Verify ownership before deletion
+        old_event = get_event(db, event_id)
+        if old_event is None or old_event.tenant_id != tenant_id:
+            _raise_not_found(event_id)
+
         db_event = delete_event(db, event_id)
         # Delete associated image if exists
         if db_event.image_path:
@@ -376,5 +360,5 @@ def delete_existing_event(event_id: UUID, db: Session = Depends(get_db)):
 
     return success_response(
         message="Event deleted successfully",
-        data=_event_to_dict(db_event),
+        data=event_to_dict(db_event),
     )

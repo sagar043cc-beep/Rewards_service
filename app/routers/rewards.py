@@ -17,6 +17,7 @@ from app.service.rewards import (
     NotFoundError,
     ValidationError,
 )
+from app.auth import get_current_tenant_id
 from app.utils.response import success_response, error_response, paginated_response
 
 router = APIRouter(prefix="/rewards", tags=["Rewards"])
@@ -55,16 +56,16 @@ def _raise_validation(exc: ValidationError) -> None:
 
 @router.get("/", status_code=status.HTTP_200_OK)
 def list_rewards(
-    tenant_id: Optional[UUID] = None,
     type: Optional[str] = None,
     is_active: Optional[bool] = None,
     page: int = 1,
     page_size: int = 10,
     db: Session = Depends(get_db),
+    tenant_id: UUID = Depends(get_current_tenant_id),
 ):
     """
-    List rewards with optional filters:
-    - tenant_id: filter by tenant
+    List rewards for the authenticated tenant.
+    Optional filters:
     - type: filter by reward type (WALLET, PACKAGE, BADGE, XP)
     - is_active: filter by active status
     Pagination via offset.
@@ -92,10 +93,14 @@ def list_rewards(
 # ─── Get Single ─────────────────────────────────────────────────────────────────
 
 @router.get("/{reward_id}", status_code=status.HTTP_200_OK)
-def read_reward(reward_id: UUID, db: Session = Depends(get_db)):
-    """Fetch a single reward by ID."""
+def read_reward(
+    reward_id: UUID,
+    db: Session = Depends(get_db),
+    tenant_id: UUID = Depends(get_current_tenant_id),
+):
+    """Fetch a single reward by ID (tenant-scoped)."""
     db_reward = get_reward(db, reward_id)
-    if not db_reward:
+    if not db_reward or db_reward.tenant_id != tenant_id:
         _raise_not_found(reward_id)
 
     return success_response(
@@ -110,12 +115,16 @@ def read_reward(reward_id: UUID, db: Session = Depends(get_db)):
 def create_new_reward(
     reward_in: RewardCreate = Body(...),
     db: Session = Depends(get_db),
+    tenant_id: UUID = Depends(get_current_tenant_id),
 ):
     """
-    Create a new reward.
+    Create a new reward for the authenticated tenant.
     Send JSON body with fields appropriate to the reward type.
     """
     try:
+        # Override tenant_id from JWT (ignore any client-provided value)
+        if hasattr(reward_in, 'tenant_id'):
+            reward_in.tenant_id = tenant_id
         db_reward = create_reward(db, reward_in)
     except ValidationError as exc:
         _raise_validation(exc)
@@ -132,12 +141,18 @@ def update_existing_reward(
     reward_id: UUID,
     reward_in: RewardUpdate = Body(...),
     db: Session = Depends(get_db),
+    tenant_id: UUID = Depends(get_current_tenant_id),
 ):
     """
     Partial update of a reward — only supplied fields are updated.
     Send JSON body with the fields to update.
     """
     try:
+        # Verify ownership before update
+        old_reward = get_reward(db, reward_id)
+        if old_reward is None or old_reward.tenant_id != tenant_id:
+            _raise_not_found(reward_id)
+
         db_reward = update_reward(db, reward_id, reward_in)
     except NotFoundError:
         _raise_not_found(reward_id)
@@ -153,9 +168,18 @@ def update_existing_reward(
 # ─── Delete ──────────────────────────────────────────────────────────────────────
 
 @router.delete("/{reward_id}", status_code=status.HTTP_200_OK)
-def delete_existing_reward(reward_id: UUID, db: Session = Depends(get_db)):
-    """Delete a reward by ID."""
+def delete_existing_reward(
+    reward_id: UUID,
+    db: Session = Depends(get_db),
+    tenant_id: UUID = Depends(get_current_tenant_id),
+):
+    """Delete a reward by ID (tenant-scoped)."""
     try:
+        # Verify ownership before deletion
+        old_reward = get_reward(db, reward_id)
+        if old_reward is None or old_reward.tenant_id != tenant_id:
+            _raise_not_found(reward_id)
+
         db_reward = delete_reward(db, reward_id)
     except NotFoundError:
         _raise_not_found(reward_id)

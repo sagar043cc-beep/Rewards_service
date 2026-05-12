@@ -19,6 +19,7 @@ from app.service.badges import (
     NotFoundError,
     ValidationError,
 )
+from app.auth import get_current_tenant_id
 from app.utils.response import success_response, error_response, paginated_response
 
 router = APIRouter(prefix="/badges", tags=["Badges"])
@@ -123,12 +124,13 @@ def list_badges(
     page: int = 1,
     page_size: int = 10,
     db: Session = Depends(get_db),
+    tenant_id: UUID = Depends(get_current_tenant_id),
 ):
-    """List all badges with cursor-safe offset pagination."""
+    """List all badges for the authenticated tenant."""
     page = max(page, 1)
     page_size = max(1, min(page_size, 100))
 
-    items, total = get_badges(db, page=page, page_size=page_size)
+    items, total = get_badges(db, tenant_id=tenant_id, page=page, page_size=page_size)
     return paginated_response(
         message="Badges fetched successfully",
         data=[_badge_to_dict(b) for b in items],
@@ -141,10 +143,14 @@ def list_badges(
 # ─── Get single ───────────────────────────────────────────────────────────────
 
 @router.get("/{badge_id}", status_code=status.HTTP_200_OK)
-def read_badge(badge_id: UUID, db: Session = Depends(get_db)):
-    """Fetch a single badge by ID."""
+def read_badge(
+    badge_id: UUID,
+    db: Session = Depends(get_db),
+    tenant_id: UUID = Depends(get_current_tenant_id),
+):
+    """Fetch a single badge by ID (tenant-scoped)."""
     db_badge = get_badge(db, badge_id)
-    if not db_badge:
+    if not db_badge or db_badge.tenant_id != tenant_id:
         _raise_not_found(badge_id)
 
     return success_response(
@@ -159,10 +165,10 @@ def read_badge(badge_id: UUID, db: Session = Depends(get_db)):
 async def create_new_badge(
     name: str = Form(...),
     icon: Optional[UploadFile] = File(None),
-    tenant_id: Optional[UUID] = Form(None),
     db: Session = Depends(get_db),
+    tenant_id: UUID = Depends(get_current_tenant_id),
 ):
-    """Create a new badge with optional icon image."""
+    """Create a new badge with optional icon image for the authenticated tenant."""
     try:
         icon_path = None
         if icon is not None:
@@ -185,21 +191,21 @@ async def update_existing_badge(
     badge_id: UUID,
     name: Optional[str] = Form(None),
     icon: Optional[UploadFile] = File(None),
-    tenant_id: Optional[UUID] = Form(None),
     db: Session = Depends(get_db),
+    tenant_id: UUID = Depends(get_current_tenant_id),
 ):
     """Partial update of a badge (only supplied fields are changed)."""
     try:
-        # Fetch existing badge for potential icon cleanup
+        # Fetch existing badge for potential icon cleanup and ownership check
         old_badge = get_badge(db, badge_id)
         if old_badge is None:
+            _raise_not_found(badge_id)
+        if old_badge.tenant_id != tenant_id:
             _raise_not_found(badge_id)
 
         update_data = {}
         if name is not None:
             update_data["name"] = name
-        if tenant_id is not None:
-            update_data["tenant_id"] = tenant_id
 
         new_icon_path = None
         if icon is not None:
@@ -234,9 +240,18 @@ async def update_existing_badge(
 # ─── Delete ───────────────────────────────────────────────────────────────────
 
 @router.delete("/{badge_id}", status_code=status.HTTP_200_OK)
-def delete_existing_badge(badge_id: UUID, db: Session = Depends(get_db)):
-    """Delete a badge by ID."""
+def delete_existing_badge(
+    badge_id: UUID,
+    db: Session = Depends(get_db),
+    tenant_id: UUID = Depends(get_current_tenant_id),
+):
+    """Delete a badge by ID (tenant-scoped)."""
     try:
+        # Verify ownership before deletion
+        old_badge = get_badge(db, badge_id)
+        if old_badge is None or old_badge.tenant_id != tenant_id:
+            _raise_not_found(badge_id)
+
         db_badge = delete_badge(db, badge_id)
         # Delete associated icon file if exists
         if db_badge.icon_path:
