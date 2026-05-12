@@ -11,15 +11,7 @@ from sqlalchemy.orm import Session
 from app.db import get_db
 from app.models.events import event_to_dict
 from app.schemas.events import EventCreate, EventUpdate
-from app.service.events import (
-    get_events,
-    get_event,
-    create_event,
-    update_event,
-    delete_event,
-    NotFoundError,
-    ValidationError,
-)
+from app.service.events import EventService, NotFoundError, ValidationError
 from app.auth import get_current_tenant_id
 from app.utils.response import success_response, paginated_response
 
@@ -34,16 +26,33 @@ os.makedirs(EVENT_UPLOAD_DIR, exist_ok=True)
 ALLOWED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 
 
+# ─── Dependency Injection ─────────────────────────────────────────────────────
+
+def get_event_service(db: Session = Depends(get_db)) -> EventService:
+    """
+    Dependency injection function to provide EventService instance.
+    
+    Args:
+        db: Database session from FastAPI dependency
+        
+    Returns:
+        EventService instance
+    """
+    return EventService(db)
+
+
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
 def _raise_not_found(event_id: UUID) -> None:
+    """Raise HTTP 404 Not Found exception."""
     raise HTTPException(
         status_code=status.HTTP_404_NOT_FOUND,
         detail=f"Event {event_id} not found.",
     )
 
 
-def _raise_validation(exc: ValidationError) -> None:
+def _raise_validation(exc: Exception) -> None:
+    """Raise HTTP 400 Bad Request exception."""
     raise HTTPException(
         status_code=status.HTTP_400_BAD_REQUEST,
         detail=str(exc),
@@ -104,26 +113,25 @@ def _delete_image_file(image_path: Optional[str]) -> None:
 @router.get("/", status_code=status.HTTP_200_OK)
 def list_events(
     tenant_id: UUID = Depends(get_current_tenant_id),
-    status: Optional[str] = None,
+    status_filter: Optional[str] = None,
     location: Optional[str] = None,
     page: int = 1,
     page_size: int = 10,
-    db: Session = Depends(get_db),
+    event_service: EventService = Depends(get_event_service),
 ):
     """
     List events for the authenticated tenant.
     Optional filters:
-    - status: filter by event status (DRAFT, ACTIVE, PAUSED, ENDED)
+    - status_filter: filter by event status (DRAFT, ACTIVE, PAUSED, ENDED)
     - location: filter by location (partial match, case-insensitive)
     Pagination via offset.
     """
     page = max(page, 1)
     page_size = max(1, min(page_size, 100))
 
-    items, total = get_events(
-        db,
+    items, total = event_service.list_events(
         tenant_id=tenant_id,
-        status=status,
+        status=status_filter,
         location=location,
         page=page,
         page_size=page_size,
@@ -142,11 +150,11 @@ def list_events(
 @router.get("/{event_id}", status_code=status.HTTP_200_OK)
 def read_event(
     event_id: UUID,
-    db: Session = Depends(get_db),
     tenant_id: UUID = Depends(get_current_tenant_id),
+    event_service: EventService = Depends(get_event_service),
 ):
     """Fetch a single event by ID (tenant-scoped)."""
-    db_event = get_event(db, event_id)
+    db_event = event_service.get_event(event_id)
     if not db_event or db_event.tenant_id != tenant_id:
         _raise_not_found(event_id)
 
@@ -162,18 +170,18 @@ def read_event(
 async def create_new_event(
     tenant_id: UUID = Depends(get_current_tenant_id),
     name: str = Form(...),
+    location: str = Form(...),
     description: Optional[str] = Form(None),
     starts_at: Optional[str] = Form(None),
     ends_at: Optional[str] = Form(None),
     image_path: Optional[str] = Form(None),
-    location: Optional[str] = Form(None),
     max_participants: int = Form(...),
     status: str = Form(...),
     type: str = Form(...),
     sort_order: Optional[int] = Form(None),
-    db: Session = Depends(get_db),
+    event_service: EventService = Depends(get_event_service),
 ):
-    """Create a new event for the authenticated tenant."""
+    """Create a new event for the authenticated tenant. Location is required."""
     try:
         # Parse optional datetime strings
         from datetime import datetime
@@ -190,7 +198,7 @@ async def create_new_event(
             except ValueError as e:
                 raise ValidationError(f"Invalid ends_at datetime format: {e}")
 
-        # Build event data without image and validate
+        # Build event data and validate
         event_data = {
             "tenant_id": tenant_id,
             "name": name,
@@ -209,7 +217,7 @@ async def create_new_event(
         except PydanticValidationError as e:
             raise ValidationError(str(e))
 
-        db_event = create_event(db, event_in)
+        db_event = event_service.create_event(event_in)
     except (ValidationError, PydanticValidationError) as exc:
         _raise_validation(exc)
 
@@ -237,12 +245,12 @@ async def update_existing_event(
     description: Optional[str] = Form(None),
     btn_name: Optional[str] = Form(None),
     sort_order: Optional[int] = Form(None),
-    db: Session = Depends(get_db),
+    event_service: EventService = Depends(get_event_service),
 ):
     """Partial update of an event (only supplied fields are changed)."""
     try:
         # Fetch existing event for potential image cleanup and ownership check
-        old_event = get_event(db, event_id)
+        old_event = event_service.get_event(event_id)
         if old_event is None:
             _raise_not_found(event_id)
         if old_event.tenant_id != tenant_id:
@@ -306,7 +314,7 @@ async def update_existing_event(
 
         try:
             event_in = EventUpdate(**update_data)
-            db_event = update_event(db, event_id, event_in)
+            db_event = event_service.update_event(event_id, event_in)
         except Exception:
             # Clean up newly saved image on any failure
             if new_image_path:
@@ -339,17 +347,17 @@ async def update_existing_event(
 @router.delete("/{event_id}", status_code=status.HTTP_200_OK)
 def delete_existing_event(
     event_id: UUID,
-    db: Session = Depends(get_db),
     tenant_id: UUID = Depends(get_current_tenant_id),
+    event_service: EventService = Depends(get_event_service),
 ):
     """Delete an event by ID (tenant-scoped)."""
     try:
         # Verify ownership before deletion
-        old_event = get_event(db, event_id)
+        old_event = event_service.get_event(event_id)
         if old_event is None or old_event.tenant_id != tenant_id:
             _raise_not_found(event_id)
 
-        db_event = delete_event(db, event_id)
+        db_event = event_service.delete_event(event_id)
         # Delete associated image if exists
         if db_event.image_path:
             _delete_image_file(db_event.image_path)

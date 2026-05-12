@@ -19,7 +19,7 @@ class EventBase(BaseModel):
     per_user_cap: int = 1
     status: EventStatus
     image_path: Optional[str] = Field(None, max_length=2048)
-    location: Optional[str] = Field(None, max_length=2048)
+    location: str = Field(..., min_length=1, max_length=2048)
     description: Optional[str] = Field(None, max_length=5000)
     btn_name: Optional[str] = Field(None, max_length=128)
     sort_order: Optional[int] = None
@@ -34,7 +34,7 @@ class EventBase(BaseModel):
 
 
 class EventCreate(BaseModel):
-    tenant_id: UUID
+    tenant_id: UUID  # Provided from JWT, not from request body
     name: str = Field(..., min_length=1, max_length=256, strip_whitespace=True)
     description: Optional[str] = Field(None, max_length=5000)
     starts_at: Optional[datetime] = None
@@ -43,7 +43,7 @@ class EventCreate(BaseModel):
     status: EventStatus
     type: EventType
     image_path: Optional[str] = Field(None, max_length=2048)
-    location: Optional[str] = Field(None, max_length=2048)
+    location: str = Field(..., min_length=1, max_length=2048)
     sort_order: Optional[int] = Field(None, ge=0)
 
     @root_validator(skip_on_failure=True)

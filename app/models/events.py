@@ -19,7 +19,7 @@ class Event(Base):
     status = Column(String, nullable=False, default='DRAFT')
     created_at = Column(DateTime, nullable=False, server_default=text('now()'))
     image_path = Column(Text)
-    location = Column(Text)
+    location = Column(Text, nullable=False)
     description = Column(Text)
     btn_name = Column(Text)
     sort_order = Column(Integer, nullable=True)  # optional display ordering
