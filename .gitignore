@@ -48,6 +48,11 @@ htmlcov/
 *.sqlite
 *.sqlite3
 
+# Credentials and sensitive files
+*-service-account.json
+gcs-service-account.json
+credentials.json
+
 # Logs
 *.log
 
