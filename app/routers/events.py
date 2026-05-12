@@ -1,6 +1,6 @@
 import logging
 import os
-import uuid
+from urllib.parse import urlparse
 from typing import Optional
 from uuid import UUID
 
@@ -12,19 +12,12 @@ from app.db import get_db
 from app.models.events import event_to_dict
 from app.schemas.events import EventCreate, EventUpdate
 from app.service.events import EventService, NotFoundError, ValidationError
+from app.service.gcs_upload import upload_image_to_gcs
 from app.auth import get_current_tenant_id
 from app.utils.response import success_response, paginated_response
 
 router = APIRouter(prefix="/events", tags=["Events"])
 logger = logging.getLogger(__name__)
-
-# Configuration for event image uploads
-EVENT_UPLOAD_DIR = os.path.join("static", "events")
-os.makedirs(EVENT_UPLOAD_DIR, exist_ok=True)
-
-# Allowed image extensions
-ALLOWED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
-
 
 # ─── Dependency Injection ─────────────────────────────────────────────────────
 
@@ -61,37 +54,60 @@ def _raise_validation(exc: Exception) -> None:
 
 def _save_image_file(upload_file: UploadFile) -> str:
     """
-    Validate and save an uploaded image file.
-    Returns the relative path (e.g., 'events/<filename>') to store in DB.
+    Validate and upload an image file to GCS.
+    Returns path in '<bucket>/<object_path>' format to store in DB.
     Raises ValidationError on invalid input.
     """
-    if not upload_file.content_type.startswith("image/"):
+    if not upload_file.content_type or not upload_file.content_type.startswith("image/"):
         raise ValidationError("Event image must be an image file.")
 
-    # Determine file extension
-    original_filename = upload_file.filename or ""
-    _, ext = os.path.splitext(original_filename)
-    ext = ext.lower()
-    if ext not in ALLOWED_IMAGE_EXTENSIONS:
-        raise ValidationError(
-            f"Unsupported image format. Allowed: {', '.join(ALLOWED_IMAGE_EXTENSIONS)}"
-        )
-
-    # Generate unique filename
-    filename = f"{uuid.uuid4().hex}{ext}"
-    relative_path = os.path.join("events", filename).replace("\\", "/")
-    full_path = os.path.join(EVENT_UPLOAD_DIR, filename)
-
     try:
-        # Read uploaded file content and write to disk
-        content = upload_file.file.read()
-        with open(full_path, "wb") as f:
-            f.write(content)
+        result = upload_image_to_gcs(file=upload_file)
+        bucket = result.get("bucket")
+        object_path = result.get("object_path")
+        if not bucket or not object_path:
+            raise ValidationError("Upload response missing bucket/object path.")
+        return f"{bucket}/{object_path}"
     except Exception as e:
-        logger.error("Failed to save event image file: %s", e)
-        raise ValidationError("Could not save event image file.") from e
+        logger.error("Failed to upload event image file: %s", e)
+        raise ValidationError("Could not upload event image file.") from e
 
-    return relative_path
+
+def _normalize_event_image_path(raw_value: Optional[str]) -> Optional[str]:
+    """
+    Normalize stored image path by trimming signed URL query params and keeping
+    only a stable object path.
+
+    Examples:
+    - https://storage.googleapis.com/bookify-gym/uploads/a.png?... -> bookify-gym/uploads/a.png
+    - https://bookify-gym.storage.googleapis.com/uploads/a.png?... -> bookify-gym/uploads/a.png
+    - /events/a.png -> events/a.png
+    """
+    if raw_value is None:
+        return None
+
+    value = raw_value.strip()
+    if not value:
+        return None
+
+    parsed = urlparse(value)
+    if parsed.scheme in {"http", "https"} and parsed.netloc:
+        path = parsed.path.lstrip("/")
+        host = parsed.netloc.lower()
+
+        if host == "storage.googleapis.com":
+            return path or None
+
+        marker = ".storage.googleapis.com"
+        if host.endswith(marker):
+            bucket = host[: -len(marker)]
+            if bucket and path:
+                return f"{bucket}/{path}"
+            return path or None
+
+        return path or None
+
+    return value.split("?", 1)[0].lstrip("/") or None
 
 
 def _delete_image_file(image_path: Optional[str]) -> None:
@@ -174,6 +190,7 @@ async def create_new_event(
     description: Optional[str] = Form(None),
     starts_at: Optional[str] = Form(None),
     ends_at: Optional[str] = Form(None),
+    image: Optional[UploadFile] = File(None),
     image_path: Optional[str] = Form(None),
     max_participants: int = Form(...),
     status: str = Form(...),
@@ -183,6 +200,10 @@ async def create_new_event(
 ):
     """Create a new event for the authenticated tenant. Location is required."""
     try:
+        normalized_image_path = _normalize_event_image_path(image_path)
+        if image is not None:
+            normalized_image_path = _save_image_file(image)
+
         # Parse optional datetime strings
         from datetime import datetime
         starts_at_dt = None
@@ -208,7 +229,7 @@ async def create_new_event(
             "max_participants": max_participants,
             "status": status,
             "type": type,
-            "image_path": image_path,
+            "image_path": normalized_image_path,
             "location": location,
             "sort_order": sort_order,
         }
@@ -241,6 +262,7 @@ async def update_existing_event(
     per_user_cap: Optional[int] = Form(None),
     status: Optional[str] = Form(None),
     image: Optional[UploadFile] = File(None),
+    image_path: Optional[str] = Form(None),
     location: Optional[str] = Form(None),
     description: Optional[str] = Form(None),
     btn_name: Optional[str] = Form(None),
@@ -279,6 +301,8 @@ async def update_existing_event(
             update_data["btn_name"] = btn_name
         if sort_order is not None:
             update_data["sort_order"] = sort_order
+        if image_path is not None:
+            update_data["image_path"] = _normalize_event_image_path(image_path)
 
         # Handle datetime fields
         from datetime import datetime

@@ -32,7 +32,7 @@ def event_to_dict(event: "Event") -> dict:
         if event.image_path.startswith(("http://", "https://")):
             image_url = event.image_path
         else:
-            image_url = f"/static/{event.image_path}"
+            image_url = f"{event.image_path}"
 
     return {
         "id": str(event.id),

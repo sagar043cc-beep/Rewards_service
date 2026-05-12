@@ -138,6 +138,8 @@ class EventService:
         if not data.get('code'):
             data['code'] = str(uuid.uuid4().hex[:8])
 
+        print(f"[create_event] data_to_store={data}")
+
         db_event = Event(**data)
         self.db.add(db_event)
 
@@ -278,4 +280,3 @@ def delete_event(db: Session, event_id: UUID) -> Event:
     """Deprecated: Use EventService.delete_event() instead."""
     service = _get_service(db)
     return service.delete_event(event_id)
-

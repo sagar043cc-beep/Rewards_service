@@ -1,18 +1,17 @@
 import logging
+from typing import List, Optional, Tuple
 from uuid import UUID
-from typing import Tuple, List, Optional
 
-from sqlalchemy import select, func, update as sa_update, delete as sa_delete
-from sqlalchemy.orm import Session
+from sqlalchemy import delete as sa_delete
+from sqlalchemy import func, select, update as sa_update
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
 from app.models.badges import Badge
 from app.schemas.badges import BadgeCreate, BadgeUpdate
 
 logger = logging.getLogger(__name__)
 
-
-# ─── Exceptions ───────────────────────────────────────────────────────────────
 
 class BadgeServiceError(Exception):
     """Base for all badge service errors."""
@@ -26,21 +25,115 @@ class ValidationError(BadgeServiceError):
     """Raised on constraint violations or invalid input."""
 
 
-# ─── Helpers ──────────────────────────────────────────────────────────────────
+class BadgeService:
+    """Object-oriented service class for badge management."""
 
-def _safe_expunge(db: Session, obj: Badge) -> Badge:
-    """
-    Expunge the given ORM object from the session so it can be used
-    after the session is closed or committed.
-    
-    For objects returned via RETURNING from INSERT/UPDATE/DELETE,
-    all column values are already populated, so no refresh is needed.
-    """
-    db.expunge(obj)
-    return obj
+    def __init__(self, db: Session):
+        self.db = db
+        self.logger = logging.getLogger(__name__)
 
+    def _safe_expunge(self, obj: Badge) -> Badge:
+        self.db.expunge(obj)
+        return obj
 
-# ─── Queries ──────────────────────────────────────────────────────────────────
+    def list_badges(
+        self,
+        tenant_id: UUID,
+        page: int = 1,
+        page_size: int = 10,
+    ) -> Tuple[List[Badge], int]:
+        offset = (page - 1) * page_size
+        count_col = func.count().over().label("total_count")
+
+        stmt = (
+            select(Badge, count_col)
+            .where(Badge.tenant_id == tenant_id)
+            .order_by(Badge.name)
+            .offset(offset)
+            .limit(page_size)
+        )
+        rows = self.db.execute(stmt).all()
+
+        if not rows:
+            return [], 0
+
+        return [row.Badge for row in rows], rows[0].total_count
+
+    def get_badge(self, badge_id: UUID) -> Optional[Badge]:
+        return self.db.execute(
+            select(Badge).where(Badge.id == badge_id)
+        ).scalar_one_or_none()
+
+    def create_badge(self, payload: BadgeCreate, tenant_id: UUID) -> Badge:
+        data = payload.model_dump()
+        data["tenant_id"] = tenant_id
+
+        db_badge = Badge(**data)
+        self.db.add(db_badge)
+        try:
+            self.db.commit()
+            self.db.refresh(db_badge)
+        except IntegrityError as exc:
+            self.db.rollback()
+            self.logger.warning("create_badge integrity error: %s", exc.orig)
+            raise ValidationError("A badge with that name already exists.") from exc
+
+        self.logger.info("Badge created: id=%s name=%r", db_badge.id, db_badge.name)
+        return db_badge
+
+    def update_badge(self, badge_id: UUID, payload: BadgeUpdate) -> Badge:
+        update_data = payload.model_dump(exclude_unset=True)
+
+        if not update_data:
+            db_badge = self.get_badge(badge_id)
+            if db_badge is None:
+                raise NotFoundError(f"Badge {badge_id} not found.")
+            return db_badge
+
+        stmt = (
+            sa_update(Badge)
+            .where(Badge.id == badge_id)
+            .values(**update_data)
+            .returning(Badge)
+        )
+        try:
+            result = self.db.execute(stmt).scalar_one_or_none()
+            if result is None:
+                self.db.rollback()
+                raise NotFoundError(f"Badge {badge_id} not found.")
+
+            refreshed = self._safe_expunge(result)
+            self.db.commit()
+        except IntegrityError as exc:
+            self.db.rollback()
+            self.logger.warning("update_badge integrity error: %s", exc.orig)
+            raise ValidationError("A badge with that name already exists.") from exc
+
+        self.logger.info("Badge updated: id=%s fields=%s", badge_id, list(update_data))
+        return refreshed
+
+    def delete_badge(self, badge_id: UUID) -> Badge:
+        stmt = (
+            sa_delete(Badge)
+            .where(Badge.id == badge_id)
+            .returning(Badge)
+        )
+        try:
+            result = self.db.execute(stmt).scalar_one_or_none()
+            if result is None:
+                self.db.rollback()
+                raise NotFoundError(f"Badge {badge_id} not found.")
+
+            refreshed = self._safe_expunge(result)
+            self.db.commit()
+        except IntegrityError as exc:
+            self.db.rollback()
+            self.logger.warning("delete_badge integrity error: %s", exc.orig)
+            raise ValidationError("Badge cannot be deleted - it is still referenced.") from exc
+
+        self.logger.info("Badge deleted: id=%s", badge_id)
+        return refreshed
+
 
 def get_badges(
     db: Session,
@@ -48,112 +141,20 @@ def get_badges(
     page: int = 1,
     page_size: int = 10,
 ) -> Tuple[List[Badge], int]:
-    """
-    Single-query pagination via window function.
-    Returns (items, total_count) in ONE database round trip.
-    """
-    offset = (page - 1) * page_size
-    count_col = func.count().over().label("total_count")
-
-    stmt = (
-        select(Badge, count_col)
-        .where(Badge.tenant_id == tenant_id)
-        .order_by(Badge.name)
-        .offset(offset)
-        .limit(page_size)
-    )
-    rows = db.execute(stmt).all()
-
-    if not rows:
-        return [], 0
-
-    return [row.Badge for row in rows], rows[0].total_count
+    return BadgeService(db).list_badges(tenant_id, page, page_size)
 
 
 def get_badge(db: Session, badge_id: UUID) -> Optional[Badge]:
-    """Fetch a single badge by primary key; returns None if absent."""
-    return db.execute(
-        select(Badge).where(Badge.id == badge_id)
-    ).scalar_one_or_none()
+    return BadgeService(db).get_badge(badge_id)
 
 
-def create_badge(db: Session, payload: BadgeCreate) -> Badge:
-    """Insert a new badge row and return the persisted instance."""
-    db_badge = Badge(**payload.model_dump())
-    db.add(db_badge)
-    try:
-        db.commit()
-        db.refresh(db_badge)
-    except IntegrityError as exc:
-        db.rollback()
-        logger.warning("create_badge integrity error: %s", exc.orig)
-        # Don't expose raw DB error — translate to a clean message
-        raise ValidationError("A badge with that name already exists.") from exc
-
-    logger.info("Badge created: id=%s name=%r", db_badge.id, db_badge.name)
-    return db_badge
+def create_badge(db: Session, payload: BadgeCreate, tenant_id: UUID) -> Badge:
+    return BadgeService(db).create_badge(payload, tenant_id)
 
 
 def update_badge(db: Session, badge_id: UUID, payload: BadgeUpdate) -> Badge:
-    """
-    SET-based UPDATE with RETURNING — no prior SELECT needed.
-    Raises NotFoundError when the badge doesn't exist.
-    """
-    update_data = payload.model_dump(exclude_unset=True)
-
-    # Nothing to change — fetch and return as-is
-    if not update_data:
-        db_badge = get_badge(db, badge_id)
-        if db_badge is None:
-            raise NotFoundError(f"Badge {badge_id} not found.")
-        return db_badge
-
-    stmt = (
-        sa_update(Badge)
-        .where(Badge.id == badge_id)
-        .values(**update_data)
-        .returning(Badge)
-    )
-    try:
-        result = db.execute(stmt).scalar_one_or_none()
-        if result is None:
-            db.rollback()
-            raise NotFoundError(f"Badge {badge_id} not found.")
-
-        # Hydrate before commit so the object stays usable after expunge
-        refreshed = _safe_expunge(db, result)
-        db.commit()
-    except IntegrityError as exc:
-        db.rollback()
-        logger.warning("update_badge integrity error: %s", exc.orig)
-        raise ValidationError("A badge with that name already exists.") from exc
-
-    logger.info("Badge updated: id=%s fields=%s", badge_id, list(update_data))
-    return refreshed
+    return BadgeService(db).update_badge(badge_id, payload)
 
 
 def delete_badge(db: Session, badge_id: UUID) -> Badge:
-    """
-    DELETE with RETURNING — one round trip.
-    Raises NotFoundError when the badge doesn't exist.
-    """
-    stmt = (
-        sa_delete(Badge)
-        .where(Badge.id == badge_id)
-        .returning(Badge)
-    )
-    try:
-        result = db.execute(stmt).scalar_one_or_none()
-        if result is None:
-            db.rollback()
-            raise NotFoundError(f"Badge {badge_id} not found.")
-
-        refreshed = _safe_expunge(db, result)
-        db.commit()
-    except IntegrityError as exc:
-        db.rollback()
-        logger.warning("delete_badge integrity error: %s", exc.orig)
-        raise ValidationError("Badge cannot be deleted — it is still referenced.") from exc
-
-    logger.info("Badge deleted: id=%s", badge_id)
-    return refreshed
+    return BadgeService(db).delete_badge(badge_id)

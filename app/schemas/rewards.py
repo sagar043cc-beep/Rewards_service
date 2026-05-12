@@ -24,7 +24,6 @@ class XpPayload(BaseModel):
 
 class RewardInputBase(BaseModel):
     """Common fields for all reward creation requests."""
-    tenant_id: Optional[UUID] = None
     name: str = Field(..., min_length=1, max_length=128, strip_whitespace=True)
     is_active: bool = True
 

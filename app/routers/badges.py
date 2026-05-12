@@ -1,36 +1,26 @@
 import logging
 import os
-import uuid
 from typing import Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Form, HTTPException, status, UploadFile, File
+from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy.orm import Session
 
 from app.db import get_db
 from app.models.badges import Badge
-from app.schemas.badges import BadgeCreate, BadgeUpdate, BadgeOut
-from app.service.badges import (
-    get_badges,
-    get_badge,
-    create_badge,
-    update_badge,
-    delete_badge,
-    NotFoundError,
-    ValidationError,
-)
+from app.schemas.badges import BadgeCreate, BadgeUpdate
+from app.service.badges import BadgeService, NotFoundError, ValidationError
+from app.service.gcs_upload import upload_image_to_gcs
 from app.auth import get_current_tenant_id
-from app.utils.response import success_response, error_response, paginated_response
+from app.utils.response import success_response, paginated_response
 
 router = APIRouter(prefix="/badges", tags=["Badges"])
 logger = logging.getLogger(__name__)
 
-# Configuration for badge icon uploads
-BADGE_UPLOAD_DIR = os.path.join("static", "badges")
-os.makedirs(BADGE_UPLOAD_DIR, exist_ok=True)
 
-# Allowed image extensions
-ALLOWED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+def get_badge_service(db: Session = Depends(get_db)) -> BadgeService:
+    return BadgeService(db)
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -38,11 +28,10 @@ ALLOWED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 def _badge_to_dict(b: Badge) -> dict:
     raw_icon = b.icon_path
     if raw_icon:
-        # If it's already a full URL, use as-is; otherwise prefix static path
         if raw_icon.startswith(("http://", "https://")):
             icon_url = raw_icon
         else:
-            icon_url = f"/static/{raw_icon}"
+            icon_url = f"{raw_icon}"
     else:
         icon_url = None
     return {
@@ -60,61 +49,84 @@ def _raise_not_found(badge_id: UUID) -> None:
     )
 
 
-def _raise_validation(exc: ValidationError) -> None:
+def _raise_validation(exc: Exception) -> None:
     raise HTTPException(
         status_code=status.HTTP_400_BAD_REQUEST,
         detail=str(exc),
     )
 
 
-def _save_icon_file(upload_file: UploadFile) -> str:
+def _save_image_file(upload_file: UploadFile) -> str:
     """
-    Validate and save an uploaded icon file.
-    Returns the relative path (e.g., 'badges/<filename>') to store in DB.
+    Validate and upload an image file to GCS.
+    Returns path in '<bucket>/<object_path>' format to store in DB.
     Raises ValidationError on invalid input.
     """
-    if not upload_file.content_type.startswith("image/"):
-        raise ValidationError("Icon must be an image file.")
-
-    # Determine file extension
-    original_filename = upload_file.filename or ""
-    _, ext = os.path.splitext(original_filename)
-    ext = ext.lower()
-    if ext not in ALLOWED_IMAGE_EXTENSIONS:
-        raise ValidationError(
-            f"Unsupported image format. Allowed: {', '.join(ALLOWED_IMAGE_EXTENSIONS)}"
-        )
-
-    # Generate unique filename
-    filename = f"{uuid.uuid4().hex}{ext}"
-    relative_path = os.path.join("badges", filename).replace("\\", "/")
-    full_path = os.path.join(BADGE_UPLOAD_DIR, filename)
+    if not upload_file.content_type or not upload_file.content_type.startswith("image/"):
+        raise ValidationError("Badge icon must be an image file.")
 
     try:
-        # Read uploaded file content and write to disk
-        content = upload_file.file.read()
-        with open(full_path, "wb") as f:
-            f.write(content)
+        result = upload_image_to_gcs(file=upload_file)
+        bucket = result.get("bucket")
+        object_path = result.get("object_path")
+        if not bucket or not object_path:
+            raise ValidationError("Upload response missing bucket/object path.")
+        return f"{bucket}/{object_path}"
     except Exception as e:
-        logger.error("Failed to save icon file: %s", e)
-        raise ValidationError("Could not save icon file.") from e
-
-    return relative_path
+        logger.error("Failed to upload badge icon file: %s", e)
+        raise ValidationError("Could not upload badge icon file.") from e
 
 
-def _delete_icon_file(icon_path: Optional[str]) -> None:
-    """Delete an icon file from disk if it exists (skip external URLs)."""
-    if not icon_path:
+def _normalize_badge_image_path(raw_value: Optional[str]) -> Optional[str]:
+    """
+    Normalize stored image path by trimming signed URL query params and keeping
+    only a stable object path.
+
+    Examples:
+    - https://storage.googleapis.com/bookify-gym/uploads/a.png?... -> bookify-gym/uploads/a.png
+    - https://bookify-gym.storage.googleapis.com/uploads/a.png?... -> bookify-gym/uploads/a.png
+    - /badges/a.png -> badges/a.png
+    """
+    if raw_value is None:
+        return None
+
+    value = raw_value.strip()
+    if not value:
+        return None
+
+    from urllib.parse import urlparse
+    parsed = urlparse(value)
+    if parsed.scheme in {"http", "https"} and parsed.netloc:
+        path = parsed.path.lstrip("/")
+        host = parsed.netloc.lower()
+
+        if host == "storage.googleapis.com":
+            return path or None
+
+        marker = ".storage.googleapis.com"
+        if host.endswith(marker):
+            bucket = host[: -len(marker)]
+            if bucket and path:
+                return f"{bucket}/{path}"
+            return path or None
+
+        return path or None
+
+    return value.split("?", 1)[0].lstrip("/") or None
+
+
+def _delete_image_file(image_path: Optional[str]) -> None:
+    """Delete a badge image file from disk if it exists (skip external URLs)."""
+    if not image_path:
         return
-    # Skip external URLs
-    if icon_path.startswith(("http://", "https://")):
+    if image_path.startswith(("http://", "https://")):
         return
-    full_path = os.path.join("static", icon_path)
+    full_path = os.path.join("static", image_path)
     try:
         if os.path.exists(full_path):
             os.remove(full_path)
     except Exception as e:
-        logger.warning("Failed to delete icon file %s: %s", full_path, e)
+        logger.warning("Failed to delete badge image file %s: %s", full_path, e)
 
 
 # ─── List ─────────────────────────────────────────────────────────────────────
@@ -123,14 +135,14 @@ def _delete_icon_file(icon_path: Optional[str]) -> None:
 def list_badges(
     page: int = 1,
     page_size: int = 10,
-    db: Session = Depends(get_db),
     tenant_id: UUID = Depends(get_current_tenant_id),
+    badge_service: BadgeService = Depends(get_badge_service),
 ):
     """List all badges for the authenticated tenant."""
     page = max(page, 1)
     page_size = max(1, min(page_size, 100))
 
-    items, total = get_badges(db, tenant_id=tenant_id, page=page, page_size=page_size)
+    items, total = badge_service.list_badges(tenant_id=tenant_id, page=page, page_size=page_size)
     return paginated_response(
         message="Badges fetched successfully",
         data=[_badge_to_dict(b) for b in items],
@@ -145,11 +157,11 @@ def list_badges(
 @router.get("/{badge_id}", status_code=status.HTTP_200_OK)
 def read_badge(
     badge_id: UUID,
-    db: Session = Depends(get_db),
     tenant_id: UUID = Depends(get_current_tenant_id),
+    badge_service: BadgeService = Depends(get_badge_service),
 ):
     """Fetch a single badge by ID (tenant-scoped)."""
-    db_badge = get_badge(db, badge_id)
+    db_badge = badge_service.get_badge(badge_id)
     if not db_badge or db_badge.tenant_id != tenant_id:
         _raise_not_found(badge_id)
 
@@ -165,17 +177,19 @@ def read_badge(
 async def create_new_badge(
     name: str = Form(...),
     icon: Optional[UploadFile] = File(None),
-    db: Session = Depends(get_db),
+    icon_path: Optional[str] = Form(None),
     tenant_id: UUID = Depends(get_current_tenant_id),
+    badge_service: BadgeService = Depends(get_badge_service),
 ):
     """Create a new badge with optional icon image for the authenticated tenant."""
     try:
-        icon_path = None
+        normalized_icon_path = _normalize_badge_image_path(icon_path)
         if icon is not None:
-            icon_path = _save_icon_file(icon)
-        badge_in = BadgeCreate(name=name, icon_path=icon_path, tenant_id=tenant_id)
-        db_badge = create_badge(db, badge_in)
-    except ValidationError as exc:
+            normalized_icon_path = _save_image_file(icon)
+
+        badge_in = BadgeCreate(name=name, icon_path=normalized_icon_path)
+        db_badge = badge_service.create_badge(badge_in, tenant_id)
+    except (ValidationError, PydanticValidationError) as exc:
         _raise_validation(exc)
 
     return success_response(
@@ -191,26 +205,40 @@ async def update_existing_badge(
     badge_id: UUID,
     name: Optional[str] = Form(None),
     icon: Optional[UploadFile] = File(None),
-    db: Session = Depends(get_db),
+    icon_path: Optional[str] = Form(None),
     tenant_id: UUID = Depends(get_current_tenant_id),
+    badge_service: BadgeService = Depends(get_badge_service),
 ):
     """Partial update of a badge (only supplied fields are changed)."""
     try:
         # Fetch existing badge for potential icon cleanup and ownership check
-        old_badge = get_badge(db, badge_id)
+        old_badge = badge_service.get_badge(badge_id)
         if old_badge is None:
             _raise_not_found(badge_id)
         if old_badge.tenant_id != tenant_id:
             _raise_not_found(badge_id)
 
+        # Initialize image path tracker for cleanup on failure
+        new_image_path = None
+
+        # Collect non-image updates
         update_data = {}
         if name is not None:
             update_data["name"] = name
+        if icon_path is not None:
+            update_data["icon_path"] = _normalize_badge_image_path(icon_path)
 
-        new_icon_path = None
+        # Validate non-image fields before potentially saving image
+        if update_data:
+            try:
+                BadgeUpdate(**update_data)  # may raise PydanticValidationError
+            except PydanticValidationError as e:
+                raise ValidationError(str(e))
+
+        # Handle image upload (after validating other fields)
         if icon is not None:
-            new_icon_path = _save_icon_file(icon)
-            update_data["icon_path"] = new_icon_path
+            new_image_path = _save_image_file(icon)
+            update_data["icon_path"] = new_image_path
 
         if not update_data:
             # Nothing to change — return existing
@@ -219,16 +247,28 @@ async def update_existing_badge(
                 data=_badge_to_dict(old_badge),
             )
 
-        badge_in = BadgeUpdate(**update_data)
-        db_badge = update_badge(db, badge_id, badge_in)
+        try:
+            badge_in = BadgeUpdate(**update_data)
+            db_badge = badge_service.update_badge(badge_id, badge_in)
+        except Exception:
+            # Clean up newly saved image on any failure
+            if new_image_path:
+                _delete_image_file(new_image_path)
+            raise
 
-        # Delete old icon file if it was replaced
-        if new_icon_path and old_badge.icon_path and old_badge.icon_path != new_icon_path:
-            _delete_icon_file(old_badge.icon_path)
+        # Delete old image if it was replaced (only on success)
+        if new_image_path and old_badge.icon_path and old_badge.icon_path != new_image_path:
+            _delete_image_file(old_badge.icon_path)
 
     except NotFoundError:
+        # Ensure cleanup if image was saved before NotFound occurred
+        if new_image_path:
+            _delete_image_file(new_image_path)
         _raise_not_found(badge_id)
-    except ValidationError as exc:
+    except (ValidationError, PydanticValidationError) as exc:
+        # Ensure cleanup if image was saved before validation error
+        if new_image_path:
+            _delete_image_file(new_image_path)
         _raise_validation(exc)
 
     return success_response(
@@ -242,20 +282,20 @@ async def update_existing_badge(
 @router.delete("/{badge_id}", status_code=status.HTTP_200_OK)
 def delete_existing_badge(
     badge_id: UUID,
-    db: Session = Depends(get_db),
     tenant_id: UUID = Depends(get_current_tenant_id),
+    badge_service: BadgeService = Depends(get_badge_service),
 ):
     """Delete a badge by ID (tenant-scoped)."""
     try:
         # Verify ownership before deletion
-        old_badge = get_badge(db, badge_id)
+        old_badge = badge_service.get_badge(badge_id)
         if old_badge is None or old_badge.tenant_id != tenant_id:
             _raise_not_found(badge_id)
 
-        db_badge = delete_badge(db, badge_id)
-        # Delete associated icon file if exists
+        db_badge = badge_service.delete_badge(badge_id)
+        # Delete associated icon image if exists
         if db_badge.icon_path:
-            _delete_icon_file(db_badge.icon_path)
+            _delete_image_file(db_badge.icon_path)
     except NotFoundError:
         _raise_not_found(badge_id)
     except ValidationError as exc:
