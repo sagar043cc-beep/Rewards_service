@@ -2,6 +2,7 @@ import uuid
 from sqlalchemy import Column, String, DateTime, Integer, Text, text
 from sqlalchemy.dialects.postgresql import UUID
 from app.db import Base
+from app.schemas.image_schema import GymImageOut
 
 
 class Event(Base):
@@ -27,12 +28,7 @@ class Event(Base):
 
 def event_to_dict(event: "Event") -> dict:
     """Convert Event ORM object to API response dict."""
-    image_url = None
-    if event.image_path:
-        if event.image_path.startswith(("http://", "https://")):
-            image_url = event.image_path
-        else:
-            image_url = f"{event.image_path}"
+    image = GymImageOut(id=str(event.id), image=event.image_path)
 
     return {
         "id": str(event.id),
@@ -45,7 +41,8 @@ def event_to_dict(event: "Event") -> dict:
         "max_participants": event.max_participants,
         "per_user_cap": event.per_user_cap,
         "status": event.status,
-        "image_url": image_url,
+        "image_path": image.image,
+        "image_url": image.image_url,
         "location": event.location,
         "description": event.description,
         "btn_name": event.btn_name,

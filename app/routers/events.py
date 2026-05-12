@@ -1,6 +1,5 @@
 import logging
 import os
-from urllib.parse import urlparse
 from typing import Optional
 from uuid import UUID
 
@@ -14,6 +13,7 @@ from app.schemas.events import EventCreate, EventUpdate
 from app.service.events import EventService, NotFoundError, ValidationError
 from app.service.gcs_upload import upload_image_to_gcs
 from app.auth import get_current_tenant_id
+from app.utils.gcs import normalize_db_image_path
 from app.utils.response import success_response, paginated_response
 
 router = APIRouter(prefix="/events", tags=["Events"])
@@ -55,7 +55,7 @@ def _raise_validation(exc: Exception) -> None:
 def _save_image_file(upload_file: UploadFile) -> str:
     """
     Validate and upload an image file to GCS.
-    Returns path in '<bucket>/<object_path>' format to store in DB.
+    Returns stable object path to store in DB, e.g. 'uploads/filename.png'.
     Raises ValidationError on invalid input.
     """
     if not upload_file.content_type or not upload_file.content_type.startswith("image/"):
@@ -63,51 +63,17 @@ def _save_image_file(upload_file: UploadFile) -> str:
 
     try:
         result = upload_image_to_gcs(file=upload_file)
-        bucket = result.get("bucket")
         object_path = result.get("object_path")
-        if not bucket or not object_path:
-            raise ValidationError("Upload response missing bucket/object path.")
-        return f"{bucket}/{object_path}"
+        if not object_path:
+            raise ValidationError("Upload response missing object path.")
+        return normalize_db_image_path(object_path) or object_path
     except Exception as e:
         logger.error("Failed to upload event image file: %s", e)
         raise ValidationError("Could not upload event image file.") from e
 
 
 def _normalize_event_image_path(raw_value: Optional[str]) -> Optional[str]:
-    """
-    Normalize stored image path by trimming signed URL query params and keeping
-    only a stable object path.
-
-    Examples:
-    - https://storage.googleapis.com/bookify-gym/uploads/a.png?... -> bookify-gym/uploads/a.png
-    - https://bookify-gym.storage.googleapis.com/uploads/a.png?... -> bookify-gym/uploads/a.png
-    - /events/a.png -> events/a.png
-    """
-    if raw_value is None:
-        return None
-
-    value = raw_value.strip()
-    if not value:
-        return None
-
-    parsed = urlparse(value)
-    if parsed.scheme in {"http", "https"} and parsed.netloc:
-        path = parsed.path.lstrip("/")
-        host = parsed.netloc.lower()
-
-        if host == "storage.googleapis.com":
-            return path or None
-
-        marker = ".storage.googleapis.com"
-        if host.endswith(marker):
-            bucket = host[: -len(marker)]
-            if bucket and path:
-                return f"{bucket}/{path}"
-            return path or None
-
-        return path or None
-
-    return value.split("?", 1)[0].lstrip("/") or None
+    return normalize_db_image_path(raw_value)
 
 
 def _delete_image_file(image_path: Optional[str]) -> None:

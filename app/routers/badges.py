@@ -9,11 +9,13 @@ from sqlalchemy.orm import Session
 
 from app.db import get_db
 from app.models.badges import Badge
+from app.schemas.image_schema import GymImageOut
 from app.schemas.badges import BadgeCreate, BadgeUpdate
 from app.service.badges import BadgeService, NotFoundError, ValidationError
 from app.service.gcs_upload import upload_image_to_gcs
 from app.auth import get_current_tenant_id
 from app.utils.response import success_response, paginated_response
+from app.utils.gcs import normalize_db_image_path
 
 router = APIRouter(prefix="/badges", tags=["Badges"])
 logger = logging.getLogger(__name__)
@@ -26,18 +28,12 @@ def get_badge_service(db: Session = Depends(get_db)) -> BadgeService:
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
 def _badge_to_dict(b: Badge) -> dict:
-    raw_icon = b.icon_path
-    if raw_icon:
-        if raw_icon.startswith(("http://", "https://")):
-            icon_url = raw_icon
-        else:
-            icon_url = f"{raw_icon}"
-    else:
-        icon_url = None
+    image = GymImageOut(id=str(b.id), image=b.icon_path)
     return {
         "id": str(b.id),
         "name": b.name,
-        "icon_url": icon_url,
+        "icon_path": image.image,
+        "icon_url": image.image_url,
         "tenant_id": str(b.tenant_id) if b.tenant_id else None,
     }
 
@@ -59,7 +55,7 @@ def _raise_validation(exc: Exception) -> None:
 def _save_image_file(upload_file: UploadFile) -> str:
     """
     Validate and upload an image file to GCS.
-    Returns path in '<bucket>/<object_path>' format to store in DB.
+    Returns stable object path to store in DB, e.g. 'uploads/filename.png'.
     Raises ValidationError on invalid input.
     """
     if not upload_file.content_type or not upload_file.content_type.startswith("image/"):
@@ -67,52 +63,17 @@ def _save_image_file(upload_file: UploadFile) -> str:
 
     try:
         result = upload_image_to_gcs(file=upload_file)
-        bucket = result.get("bucket")
         object_path = result.get("object_path")
-        if not bucket or not object_path:
-            raise ValidationError("Upload response missing bucket/object path.")
-        return f"{bucket}/{object_path}"
+        if not object_path:
+            raise ValidationError("Upload response missing object path.")
+        return normalize_db_image_path(object_path) or object_path
     except Exception as e:
         logger.error("Failed to upload badge icon file: %s", e)
         raise ValidationError("Could not upload badge icon file.") from e
 
 
 def _normalize_badge_image_path(raw_value: Optional[str]) -> Optional[str]:
-    """
-    Normalize stored image path by trimming signed URL query params and keeping
-    only a stable object path.
-
-    Examples:
-    - https://storage.googleapis.com/bookify-gym/uploads/a.png?... -> bookify-gym/uploads/a.png
-    - https://bookify-gym.storage.googleapis.com/uploads/a.png?... -> bookify-gym/uploads/a.png
-    - /badges/a.png -> badges/a.png
-    """
-    if raw_value is None:
-        return None
-
-    value = raw_value.strip()
-    if not value:
-        return None
-
-    from urllib.parse import urlparse
-    parsed = urlparse(value)
-    if parsed.scheme in {"http", "https"} and parsed.netloc:
-        path = parsed.path.lstrip("/")
-        host = parsed.netloc.lower()
-
-        if host == "storage.googleapis.com":
-            return path or None
-
-        marker = ".storage.googleapis.com"
-        if host.endswith(marker):
-            bucket = host[: -len(marker)]
-            if bucket and path:
-                return f"{bucket}/{path}"
-            return path or None
-
-        return path or None
-
-    return value.split("?", 1)[0].lstrip("/") or None
+    return normalize_db_image_path(raw_value)
 
 
 def _delete_image_file(image_path: Optional[str]) -> None:
