@@ -88,17 +88,18 @@ def _validate_upload(file: UploadFile) -> None:
         )
 
 
-def upload_event_image_to_gcs(*, file: UploadFile, tenant_id: UUID) -> dict:
+def _build_unique_name(file: UploadFile) -> str:
+    ext = _get_extension(file.filename)
+    base_name = _sanitize_filename((file.filename or "image").rsplit(".", 1)[0])
+    return f"{base_name}_{uuid4().hex}{ext}"
+
+
+def _upload_and_sign(*, file: UploadFile, object_path: str) -> dict:
     _validate_upload(file)
 
     bucket_name = _get_bucket_name()
     client = _get_storage_client()
     bucket = client.bucket(bucket_name)
-
-    ext = _get_extension(file.filename)
-    base_name = _sanitize_filename((file.filename or "image").rsplit(".", 1)[0])
-    unique_name = f"{base_name}_{uuid4().hex}{ext}"
-    object_path = f"tenants/{tenant_id}/events/{unique_name}"
 
     try:
         blob = bucket.blob(object_path)
@@ -122,39 +123,15 @@ def upload_event_image_to_gcs(*, file: UploadFile, tenant_id: UUID) -> dict:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to upload image to GCS.",
         ) from exc
+
+
+def upload_event_image_to_gcs(*, file: UploadFile, tenant_id: UUID) -> dict:
+    unique_name = _build_unique_name(file)
+    object_path = f"tenants/{tenant_id}/events/{unique_name}"
+    return _upload_and_sign(file=file, object_path=object_path)
 
 
 def upload_image_to_gcs(*, file: UploadFile) -> dict:
-    _validate_upload(file)
-
-    bucket_name = _get_bucket_name()
-    client = _get_storage_client()
-    bucket = client.bucket(bucket_name)
-
-    ext = _get_extension(file.filename)
-    base_name = _sanitize_filename((file.filename or "image").rsplit(".", 1)[0])
-    unique_name = f"{base_name}_{uuid4().hex}{ext}"
+    unique_name = _build_unique_name(file)
     object_path = f"uploads/{unique_name}"
-
-    try:
-        blob = bucket.blob(object_path)
-        file.file.seek(0)
-        blob.upload_from_file(file.file, content_type=file.content_type)
-
-        expires = int(os.getenv("GCS_SIGNED_URL_EXPIRES_SECONDS", "3600"))
-        signed_url = blob.generate_signed_url(
-            version="v4",
-            expiration=timedelta(seconds=expires),
-            method="GET",
-        )
-
-        return {
-            "bucket": bucket_name,
-            "object_path": object_path,
-            "url": signed_url,
-        }
-    except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to upload image to GCS.",
-        ) from exc
+    return _upload_and_sign(file=file, object_path=object_path)

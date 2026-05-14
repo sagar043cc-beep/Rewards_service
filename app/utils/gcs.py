@@ -14,18 +14,38 @@ GCS_BASE_URL = "https://storage.googleapis.com"
 storage_client = storage.Client()
 
 
+def _normalize_object_path(raw_value: str, folder: str = GCS_UPLOAD_FOLDER) -> str:
+    """
+    Convert any URL/path into a stable object key under `folder`.
+    Examples:
+    - Screenshot.png -> uploads/Screenshot.png
+    - uploads/Screenshot.png -> uploads/Screenshot.png
+    - bookify-gym/uploads/Screenshot.png -> uploads/Screenshot.png
+    - https://storage.googleapis.com/bookify-gym/uploads/Screenshot.png?... -> uploads/Screenshot.png
+    """
+    value = raw_value.strip().split("?", 1)[0]
+    parsed = urlparse(value)
+
+    if parsed.scheme in {"http", "https"} and parsed.netloc:
+        path = parsed.path.lstrip("/")
+    else:
+        path = value.lstrip("/")
+
+    bucket_prefix = f"{GCS_BUCKET_NAME}/"
+    folder_prefix = f"{folder}/"
+
+    if path.startswith(bucket_prefix):
+        path = path[len(bucket_prefix):]
+    if path.startswith(folder_prefix):
+        return path
+    return f"{folder_prefix}{path}"
+
+
 def get_db_path(filename: str) -> str:
-    """
-    Given a filename, return what you store in DB.
-    e.g. "Screenshot_1_abc.png"
-    """
+    """Given a filename/path/url, return DB key like 'uploads/<name>'."""
     if not filename:
         return filename
-
-    clean = filename.strip().split("?", 1)[0].lstrip("/")
-    if clean.startswith(f"{GCS_UPLOAD_FOLDER}/"):
-        return clean
-    return f"{GCS_UPLOAD_FOLDER}/{clean}"
+    return _normalize_object_path(filename)
 
 
 def normalize_db_image_path(raw_value: str | None) -> str | None:
@@ -36,27 +56,7 @@ def normalize_db_image_path(raw_value: str | None) -> str | None:
     value = raw_value.strip()
     if not value:
         return None
-
-    parsed = urlparse(value)
-    if parsed.scheme in {"http", "https"} and parsed.netloc:
-        path = parsed.path.lstrip("/")
-        host = parsed.netloc.lower()
-
-        if host == "storage.googleapis.com":
-            # e.g. /bookify-gym/uploads/file.png
-            bucket_prefix = f"{GCS_BUCKET_NAME}/"
-            if path.startswith(bucket_prefix):
-                path = path[len(bucket_prefix):]
-            return get_db_path(path)
-
-        marker = ".storage.googleapis.com"
-        if host.endswith(marker):
-            # e.g. https://bookify-gym.storage.googleapis.com/uploads/file.png
-            return get_db_path(path)
-
-        return get_db_path(path)
-
-    return get_db_path(value)
+    return _normalize_object_path(value)
 
 
 def build_signed_url(db_image_path: str, expiration_minutes: int = 60) -> str | None:
