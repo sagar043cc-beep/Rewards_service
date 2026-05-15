@@ -1,6 +1,8 @@
+
 import logging
 import os
-from typing import Optional
+from datetime import datetime
+from typing import Optional, List
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Form, HTTPException, status, UploadFile, File
@@ -9,8 +11,10 @@ from sqlalchemy.orm import Session
 
 from app.db import get_db
 from app.models.events import event_to_dict
+from app.models.rewards import Reward
 from app.schemas.events import EventCreate, EventUpdate
 from app.service.events import EventService, NotFoundError, ValidationError
+from app.service.rewards import RewardService
 from app.service.gcs_upload import upload_image_to_gcs
 from app.auth import get_current_tenant_id
 from app.utils.gcs import normalize_db_image_path
@@ -19,25 +23,20 @@ from app.utils.response import success_response, paginated_response
 router = APIRouter(prefix="/events", tags=["Events"])
 logger = logging.getLogger(__name__)
 
-# ─── Dependency Injection ─────────────────────────────────────────────────────
+
+# ─── Dependency ───────────────────────────────────────────────────────────────
 
 def get_event_service(db: Session = Depends(get_db)) -> EventService:
-    """
-    Dependency injection function to provide EventService instance.
-    
-    Args:
-        db: Database session from FastAPI dependency
-        
-    Returns:
-        EventService instance
-    """
     return EventService(db)
 
 
-# ─── Helpers ─────────────────────────────────────────────────────────────────
+def get_reward_service(db: Session = Depends(get_db)) -> RewardService:
+    return RewardService(db)
+
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _raise_not_found(event_id: UUID) -> None:
-    """Raise HTTP 404 Not Found exception."""
     raise HTTPException(
         status_code=status.HTTP_404_NOT_FOUND,
         detail=f"Event {event_id} not found.",
@@ -45,18 +44,45 @@ def _raise_not_found(event_id: UUID) -> None:
 
 
 def _raise_validation(exc: Exception) -> None:
-    """Raise HTTP 400 Bad Request exception."""
     raise HTTPException(
         status_code=status.HTTP_400_BAD_REQUEST,
         detail=str(exc),
     )
 
 
+def _reward_to_dict(r: "Reward") -> dict:
+    return {
+        "id": str(r.id),
+        "tenant_id": str(r.tenant_id) if r.tenant_id else None,
+        "name": r.name,
+        "type": r.type,
+        "payload": r.payload,
+        "is_active": r.is_active,
+        "created_at": r.created_at.isoformat() if r.created_at else None,
+    }
+
+
+def _event_reward_to_dict(
+    event_id: "UUID",
+    reward_id: "UUID",
+    tier: int,
+    reward: Optional["Reward"] = None,
+) -> dict:
+    result: dict = {
+        "event_id": str(event_id),
+        "reward_id": str(reward_id),
+        "tier": tier,
+    }
+    if reward is not None:
+        result["reward"] = _reward_to_dict(reward)
+    return result
+
+
 def _save_image_file(upload_file: UploadFile) -> str:
     """
     Validate and upload an image file to GCS.
-    Returns stable object path to store in DB, e.g. 'uploads/filename.png'.
-    Raises ValidationError on invalid input.
+    Returns the stable object path to store in the DB, e.g. 'uploads/filename.png'.
+    Raises ValidationError on invalid input or upload failure.
     """
     if not upload_file.content_type or not upload_file.content_type.startswith("image/"):
         raise ValidationError("Event image must be an image file.")
@@ -67,27 +93,31 @@ def _save_image_file(upload_file: UploadFile) -> str:
         if not object_path:
             raise ValidationError("Upload response missing object path.")
         return normalize_db_image_path(object_path) or object_path
-    except Exception as e:
-        logger.error("Failed to upload event image file: %s", e)
-        raise ValidationError("Could not upload event image file.") from e
+    except ValidationError:
+        raise
+    except Exception as exc:
+        logger.error("Failed to upload event image file: %s", exc)
+        raise ValidationError("Could not upload event image file.") from exc
 
 
-def _normalize_event_image_path(raw_value: Optional[str]) -> Optional[str]:
-    return normalize_db_image_path(raw_value)
+def _parse_datetime(value: str, field_name: str) -> datetime:
+    """Parse an ISO datetime string, raising ValidationError on failure."""
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValidationError(f"Invalid {field_name} datetime format: {exc}") from exc
 
 
 def _delete_image_file(image_path: Optional[str]) -> None:
-    """Delete an event image file from disk if it exists (skip external URLs)."""
-    if not image_path:
-        return
-    if image_path.startswith(("http://", "https://")):
+    """Delete a local event image if it exists (skips external URLs)."""
+    if not image_path or image_path.startswith(("http://", "https://")):
         return
     full_path = os.path.join("static", image_path)
     try:
         if os.path.exists(full_path):
             os.remove(full_path)
-    except Exception as e:
-        logger.warning("Failed to delete event image file %s: %s", full_path, e)
+    except Exception as exc:
+        logger.warning("Failed to delete event image file %s: %s", full_path, exc)
 
 
 # ─── List ─────────────────────────────────────────────────────────────────────
@@ -103,10 +133,10 @@ def list_events(
 ):
     """
     List events for the authenticated tenant.
+
     Optional filters:
-    - status_filter: filter by event status (DRAFT, ACTIVE, PAUSED, ENDED)
-    - location: filter by location (partial match, case-insensitive)
-    Pagination via offset.
+    - status_filter: DRAFT | ACTIVE | PAUSED | ENDED
+    - location: partial match, case-insensitive
     """
     page = max(page, 1)
     page_size = max(1, min(page_size, 100))
@@ -118,9 +148,12 @@ def list_events(
         page=page,
         page_size=page_size,
     )
+    event_ids = [item.id for item in items]
+    condition_map = event_service.get_event_conditions_map(event_ids)
+    rewards_map = event_service.get_event_rewards_details_map(event_ids)
     return paginated_response(
         message="Events fetched successfully",
-        data=[event_to_dict(e) for e in items],
+        data=[event_to_dict(e, condition_map.get(e.id), rewards_map.get(e.id, [])) for e in items],
         total=total,
         page=page,
         page_size=page_size,
@@ -134,15 +167,34 @@ def read_event(
     event_id: UUID,
     tenant_id: UUID = Depends(get_current_tenant_id),
     event_service: EventService = Depends(get_event_service),
+    reward_service: RewardService = Depends(get_reward_service),
 ):
     """Fetch a single event by ID (tenant-scoped)."""
     db_event = event_service.get_event(event_id)
     if not db_event or db_event.tenant_id != tenant_id:
         _raise_not_found(event_id)
 
+    condition = event_service.get_event_condition(db_event.id)
+    rewards_map = event_service.get_event_rewards_details_map([db_event.id])
+    event_rewards = rewards_map.get(db_event.id, [])
+
+    # Fallback: if event has direct reward_id but no event_rewards rows,
+    # include reward details in response.
+    if db_event.reward_id and not event_rewards:
+        db_reward = reward_service.get_reward(db_event.reward_id)
+        if db_reward and db_reward.tenant_id == tenant_id:
+            event_rewards = [{
+                "reward_id": str(db_reward.id),
+                "tier": 1,
+                "name": db_reward.name,
+                "type": db_reward.type,
+                "payload": db_reward.payload,
+                "is_active": db_reward.is_active,
+            }]
+
     return success_response(
         message="Event fetched successfully",
-        data=event_to_dict(db_event),
+        data=event_to_dict(db_event, condition, event_rewards),
     )
 
 
@@ -161,56 +213,133 @@ async def create_new_event(
     max_participants: int = Form(...),
     status: str = Form(...),
     type: str = Form(...),
+    action_type: Optional[str] = Form(None),
+    equality: Optional[str] = Form(None),
+    package_ids: Optional[str] = Form(None),
+    qty: Optional[int] = Form(None),
+    logical_group: Optional[int] = Form(None),
     sort_order: Optional[int] = Form(None),
+    reward_id: Optional[str] = Form(None),
     event_service: EventService = Depends(get_event_service),
 ):
-    """Create a new event for the authenticated tenant. Location is required."""
+    """Create a new event for the authenticated tenant."""
     try:
-        normalized_image_path = _normalize_event_image_path(image_path)
+        # Resolve image path
+        normalized_image_path = normalize_db_image_path(image_path) if image_path else None
         if image is not None:
             normalized_image_path = _save_image_file(image)
 
-        # Parse optional datetime strings
-        from datetime import datetime
-        starts_at_dt = None
-        if starts_at:
-            try:
-                starts_at_dt = datetime.fromisoformat(starts_at.replace('Z', '+00:00'))
-            except ValueError as e:
-                raise ValidationError(f"Invalid starts_at datetime format: {e}")
-        ends_at_dt = None
-        if ends_at:
-            try:
-                ends_at_dt = datetime.fromisoformat(ends_at.replace('Z', '+00:00'))
-            except ValueError as e:
-                raise ValidationError(f"Invalid ends_at datetime format: {e}")
+        # Parse datetime strings
+        starts_at_dt = _parse_datetime(starts_at, "starts_at") if starts_at else None
+        ends_at_dt = _parse_datetime(ends_at, "ends_at") if ends_at else None
 
-        # Build event data and validate
-        event_data = {
-            "tenant_id": tenant_id,
-            "name": name,
-            "description": description,
-            "starts_at": starts_at_dt,
-            "ends_at": ends_at_dt,
-            "max_participants": max_participants,
-            "status": status,
-            "type": type,
-            "image_path": normalized_image_path,
-            "location": location,
-            "sort_order": sort_order,
-        }
+        # Parse comma-separated package_ids
+        parsed_package_ids: Optional[list] = None
+        if package_ids:
+            parsed_package_ids = []
+            for raw in package_ids.split(","):
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    parsed_package_ids.append(UUID(raw))
+                except ValueError:
+                    raise ValidationError(f"Invalid package id: {raw!r}")
+
+        # Parse and validate reward_id
+        parsed_reward_id: Optional[UUID] = None
+        if reward_id:
+            try:
+                parsed_reward_id = UUID(reward_id)
+                # Validate that reward belongs to this tenant
+                valid_count = event_service.count_rewards_by_ids_for_tenant([parsed_reward_id], tenant_id)
+                if valid_count != 1:
+                    raise ValidationError("Reward does not exist or does not belong to this tenant.")
+            except ValueError:
+                raise ValidationError(f"Invalid reward id: {reward_id!r}")
+
         try:
-            event_in = EventCreate(**event_data)  # may raise PydanticValidationError
-        except PydanticValidationError as e:
-            raise ValidationError(str(e))
+            event_in = EventCreate(
+                tenant_id=tenant_id,
+                name=name,
+                description=description,
+                starts_at=starts_at_dt,
+                ends_at=ends_at_dt,
+                max_participants=max_participants,
+                status=status,
+                type=type,
+                action_type=action_type,
+                equality=equality,
+                package_ids=parsed_package_ids,
+                qty=qty if qty is not None else logical_group,
+                image_path=normalized_image_path,
+                location=location,
+                sort_order=sort_order,
+                reward_id=parsed_reward_id,
+            )
+        except PydanticValidationError as exc:
+            raise ValidationError(str(exc)) from exc
 
         db_event = event_service.create_event(event_in)
+
     except (ValidationError, PydanticValidationError) as exc:
         _raise_validation(exc)
 
     return success_response(
         message="Event created successfully",
-        data=event_to_dict(db_event),
+        data=event_to_dict(db_event, event_service.get_event_condition(db_event.id)),
+    )
+
+
+@router.post("/{event_id}/rewards", status_code=status.HTTP_201_CREATED)
+def add_rewards_to_event(
+    event_id: UUID,
+    reward_id: Optional[str] = Form(None),
+    tier: int = Form(1),
+    tenant_id: UUID = Depends(get_current_tenant_id),
+    event_service: EventService = Depends(get_event_service),
+    reward_service: RewardService = Depends(get_reward_service),
+):
+    """Add a single reward to an event and store it in the event's reward_id column."""
+    try:
+        if tier < 1:
+            raise ValidationError("tier must be greater than or equal to 1.")
+
+        db_event = event_service.get_event(event_id)
+        if not db_event or db_event.tenant_id != tenant_id:
+            _raise_not_found(event_id)
+
+        if not reward_id:
+            raise ValidationError("Send reward_id.")
+
+        try:
+            parsed_reward_id = UUID(reward_id.strip())
+        except ValueError:
+            raise ValidationError(f"Invalid reward id: {reward_id!r}")
+
+        # Validate that reward belongs to this tenant
+        valid_count = event_service.count_rewards_by_ids_for_tenant([parsed_reward_id], tenant_id)
+        if valid_count != 1:
+            raise ValidationError("Reward does not exist or does not belong to this tenant.")
+
+        # Update the event's reward_id column
+        event_service.update_event_reward_id(event_id, parsed_reward_id)
+        updated_event = event_service.get_event(event_id)
+
+        # Fetch the full reward for the response payload
+        db_reward = reward_service.get_reward(parsed_reward_id)
+
+    except (ValidationError, PydanticValidationError) as exc:
+        _raise_validation(exc)
+
+    return success_response(
+        message="Reward added to event successfully",
+        data=_event_reward_to_dict(
+            event_id=updated_event.id,
+            reward_id=parsed_reward_id,
+            tier=tier,
+            reward=db_reward,
+        ),
     )
 
 
@@ -236,19 +365,16 @@ async def update_existing_event(
     event_service: EventService = Depends(get_event_service),
 ):
     """Partial update of an event (only supplied fields are changed)."""
+    new_image_path: Optional[str] = None
+
     try:
-        # Fetch existing event for potential image cleanup and ownership check
+        # Ownership check
         old_event = event_service.get_event(event_id)
-        if old_event is None:
-            _raise_not_found(event_id)
-        if old_event.tenant_id != tenant_id:
+        if old_event is None or old_event.tenant_id != tenant_id:
             _raise_not_found(event_id)
 
-        # Initialize image path tracker for cleanup on failure
-        new_image_path = None
-
-        # Collect non-image updates
-        update_data = {}
+        # Build update dict from supplied fields only
+        update_data: dict = {}
         if name is not None:
             update_data["name"] = name
         if type is not None:
@@ -268,67 +394,49 @@ async def update_existing_event(
         if sort_order is not None:
             update_data["sort_order"] = sort_order
         if image_path is not None:
-            update_data["image_path"] = _normalize_event_image_path(image_path)
-
-        # Handle datetime fields
-        from datetime import datetime
+            update_data["image_path"] = normalize_db_image_path(image_path)
         if starts_at is not None:
-            try:
-                update_data["starts_at"] = datetime.fromisoformat(starts_at.replace('Z', '+00:00'))
-            except ValueError as e:
-                raise ValidationError(f"Invalid starts_at datetime format: {e}")
+            update_data["starts_at"] = _parse_datetime(starts_at, "starts_at")
         if ends_at is not None:
-            try:
-                update_data["ends_at"] = datetime.fromisoformat(ends_at.replace('Z', '+00:00'))
-            except ValueError as e:
-                raise ValidationError(f"Invalid ends_at datetime format: {e}")
+            update_data["ends_at"] = _parse_datetime(ends_at, "ends_at")
 
-        # Validate non-image fields before potentially saving image
+        # Validate non-image fields before touching GCS
         if update_data:
             try:
-                EventUpdate(**update_data)  # may raise PydanticValidationError
-            except PydanticValidationError as e:
-                raise ValidationError(str(e))
+                EventUpdate(**update_data)
+            except PydanticValidationError as exc:
+                raise ValidationError(str(exc)) from exc
 
-        # Handle image upload (after validating other fields)
+        # Upload image only after other fields are validated
         if image is not None:
             new_image_path = _save_image_file(image)
             update_data["image_path"] = new_image_path
 
         if not update_data:
-            # Nothing to change — return existing
             return success_response(
                 message="Event updated successfully",
-                data=event_to_dict(old_event),
+                data=event_to_dict(old_event, event_service.get_event_condition(old_event.id)),
             )
 
-        try:
-            event_in = EventUpdate(**update_data)
-            db_event = event_service.update_event(event_id, event_in)
-        except Exception:
-            # Clean up newly saved image on any failure
-            if new_image_path:
-                _delete_image_file(new_image_path)
-            raise
+        db_event = event_service.update_event(event_id, EventUpdate(**update_data))
 
-        # Delete old image if it was replaced (only on success)
+        # Clean up the old image only after a successful DB update
         if new_image_path and old_event.image_path and old_event.image_path != new_image_path:
             _delete_image_file(old_event.image_path)
 
     except NotFoundError:
-        # Ensure cleanup if image was saved before NotFound occurred
-        if new_image_path:
-            _delete_image_file(new_image_path)
+        _delete_image_file(new_image_path)
         _raise_not_found(event_id)
     except (ValidationError, PydanticValidationError) as exc:
-        # Ensure cleanup if image was saved before validation error
-        if new_image_path:
-            _delete_image_file(new_image_path)
+        _delete_image_file(new_image_path)
         _raise_validation(exc)
+    except Exception:
+        _delete_image_file(new_image_path)
+        raise
 
     return success_response(
         message="Event updated successfully",
-        data=event_to_dict(db_event),
+        data=event_to_dict(db_event, event_service.get_event_condition(db_event.id)),
     )
 
 
@@ -342,15 +450,13 @@ def delete_existing_event(
 ):
     """Delete an event by ID (tenant-scoped)."""
     try:
-        # Verify ownership before deletion
         old_event = event_service.get_event(event_id)
         if old_event is None or old_event.tenant_id != tenant_id:
             _raise_not_found(event_id)
 
         db_event = event_service.delete_event(event_id)
-        # Delete associated image if exists
-        if db_event.image_path:
-            _delete_image_file(db_event.image_path)
+        _delete_image_file(db_event.image_path)
+
     except NotFoundError:
         _raise_not_found(event_id)
     except ValidationError as exc:
@@ -358,5 +464,5 @@ def delete_existing_event(
 
     return success_response(
         message="Event deleted successfully",
-        data=event_to_dict(db_event),
+        data=event_to_dict(db_event, event_service.get_event_condition(db_event.id)),
     )

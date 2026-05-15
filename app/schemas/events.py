@@ -42,9 +42,14 @@ class EventCreate(BaseModel):
     max_participants: int = Field(..., ge=1)
     status: EventStatus
     type: EventType
+    action_type: Optional[str] = Field(None, min_length=1, max_length=128)
+    equality: Optional[str] = Field(None, min_length=1, max_length=128)
+    package_ids: Optional[list[UUID]] = None
+    qty: Optional[int] = Field(None, ge=1)
     image_path: Optional[str] = Field(None, max_length=2048)
     location: str = Field(..., min_length=1, max_length=2048)
     sort_order: Optional[int] = Field(None, ge=0)
+    reward_id: Optional[UUID] = None
 
     @root_validator(skip_on_failure=True)
     def validate_event_window(cls, values):
@@ -52,6 +57,14 @@ class EventCreate(BaseModel):
         ends_at = values.get("ends_at")
         if starts_at and ends_at and ends_at <= starts_at:
             raise ValueError("ends_at must be greater than starts_at")
+        event_type = values.get("type")
+        action_type = values.get("action_type")
+        package_ids = values.get("package_ids")
+        if event_type == "action":
+            if not action_type:
+                raise ValueError("action_type is required when type is 'action'")
+            if action_type == "package_purchase" and not package_ids:
+                raise ValueError("package_ids is required when action_type is 'package_purchase'")
         return values
 
 
